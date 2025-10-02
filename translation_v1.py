@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from pydub import AudioSegment
 from pydub.playback import play
 from deepgram import DeepgramClient, PrerecordedOptions
-from google.cloud import texttospeech  # <-- THE MISSING IMPORT IS ADDED HERE
+from google.cloud import texttospeech
 
 load_dotenv()
 AUDIO_FILE_PATH = "live.m4a"
@@ -13,7 +13,7 @@ OUTPUT_AUDIO_FILENAME = "output_speech.mp3"
 # --- !! LANGUAGE CONFIGURATION !! ---
 # all suppported languages: https://cloud.google.com/text-to-speech/docs/list-voices-and-types#list_of_all_supported_languages
 SOURCE_LANGUAGE = "en-US" 
-TARGET_LANGUAGE = "vi-VN" 
+TARGET_LANGUAGE = "hi-IN" 
 
 def translate_text_with_mymemory(text, source_lang, target_lang):
     print(f"\n2. Translating from '{source_lang}' to '{target_lang}'...")
