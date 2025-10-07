@@ -1,0 +1,14 @@
+# requirements.txt (updated)
+
+# Google Cloud Libraries
+google-cloud-speech
+google-cloud-texttospeech
+google-cloud-translate
+
+# Audio Handling
+sounddevice
+numpy
+pydub
+
+# Environment Variable Management
+python-dotenv
