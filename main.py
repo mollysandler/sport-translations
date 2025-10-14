@@ -16,6 +16,11 @@ from config import SOURCE_LANGUAGE, TARGET_LANGUAGE, RATE, CHUNK
 
 load_dotenv()
 
+SPEAKER_VOICES = {
+    1: "es-ES-Wavenet-B",  # A male voice
+    2: "es-ES-Wavenet-C",  # A female voice
+}
+
 class RealTimeTranslator:
     """
     A class that handles the real-time translation process in background threads.
@@ -29,6 +34,9 @@ class RealTimeTranslator:
         self.audio_output_queue = queue.Queue()
         self.shutdown_event = threading.Event()
         self.threads = []
+        self.processed_word_count = 0 
+
+        # self.last_transcript = ""
 
     def _microphone_thread(self):
         def audio_callback(indata, frames, time, status):
@@ -49,10 +57,16 @@ class RealTimeTranslator:
 
     def _google_stt_thread(self):
         client = speech.SpeechClient()
+        diarization_config = speech.SpeakerDiarizationConfig(
+            enable_speaker_diarization=True,
+            min_speaker_count=2,
+            max_speaker_count=2,
+        )
         config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             sample_rate_hertz=RATE,
             language_code=SOURCE_LANGUAGE,
+            diarization_config=diarization_config,
         )
         streaming_config = speech.StreamingRecognitionConfig(
             config=config, interim_results=False
@@ -64,10 +78,7 @@ class RealTimeTranslator:
                 if chunk is None: return
                 yield chunk
 
-        requests = (
-            speech.StreamingRecognizeRequest(audio_content=content)
-            for content in audio_generator()
-        )
+        requests = (speech.StreamingRecognizeRequest(audio_content=content) for content in audio_generator())
         
         print("🔊 Speech-to-Text is running...", flush=True)
         try:
@@ -79,13 +90,41 @@ class RealTimeTranslator:
                 result = response.results[0]
                 if not result.alternatives or not result.is_final: continue
                 
-                transcript = result.alternatives[0].transcript.strip()
-                if transcript:
-                    print(f"   » Original ({SOURCE_LANGUAGE}): {transcript}", flush=True)
-                    self.transcript_queue.put(transcript)
+                # --- START OF NEW LOGIC ---
+                all_words = result.alternatives[0].words
+                new_words = all_words[self.processed_word_count:]
+
+                if not new_words: continue
+
+                # Group new words by speaker tag
+                speaker_chunks = []
+                current_speaker = new_words[0].speaker_tag
+                current_chunk = []
+
+                for word_info in new_words:
+                    if word_info.speaker_tag == current_speaker:
+                        current_chunk.append(word_info.word)
+                    else:
+                        # Speaker changed, finalize the previous chunk
+                        speaker_chunks.append({'speaker': current_speaker, 'text': ' '.join(current_chunk)})
+                        # Start a new chunk
+                        current_speaker = word_info.speaker_tag
+                        current_chunk = [word_info.word]
+                
+                # Add the last chunk
+                speaker_chunks.append({'speaker': current_speaker, 'text': ' '.join(current_chunk)})
+
+                # Put each speaker's chunk on the queue
+                for chunk in speaker_chunks:
+                    print(f"   » Speaker {chunk['speaker']} ({SOURCE_LANGUAGE}): {chunk['text']}", flush=True)
+                    self.transcript_queue.put(chunk)
+
+                self.processed_word_count = len(all_words)
+                # --- END OF NEW LOGIC ---
+
         except Exception as e:
             if not self.shutdown_event.is_set():
-                 print(f"An error occurred in the STT thread: {e}", flush=True)
+                    print(f"An error occurred in the STT thread: {e}", flush=True)
 
     def _translation_thread(self):
         client = translate.Client()
@@ -94,28 +133,48 @@ class RealTimeTranslator:
         
         print("🌐 Translation service is running...", flush=True)
         while not self.shutdown_event.is_set():
-            text_to_translate = self.transcript_queue.get()
-            if text_to_translate is None: continue
+            # --- MODIFICATION: Get dictionary instead of string ---
+            chunk_to_translate = self.transcript_queue.get()
+            if chunk_to_translate is None: continue
             
+            text_to_translate = chunk_to_translate['text']
+            speaker = chunk_to_translate['speaker']
+
             result = client.translate(
                 text_to_translate,
                 target_language=target_lang_short,
                 source_language=source_lang_short
             )
             translated_text = result["translatedText"]
-            print(f"   » Translated ({self.target_language}): {translated_text}", flush=True)
-            self.translation_queue.put(translated_text)
+
+            # --- MODIFICATION: Pass a new dictionary to the next queue ---
+            translated_chunk = {'speaker': speaker, 'text': translated_text}
+            print(f"   » Translated for Speaker {speaker} ({self.target_language}): {translated_text}", flush=True)
+            self.translation_queue.put(translated_chunk)
+
+    # In main.py, replace your _google_tts_thread method
 
     def _google_tts_thread(self):
         client = texttospeech.TextToSpeechClient()
-        voice = texttospeech.VoiceSelectionParams(language_code=self.target_language)
         audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
         
         print("🗣️ Text-to-Speech service is running...", flush=True)
         while not self.shutdown_event.is_set():
-            text_to_synthesize = self.translation_queue.get()
-            if text_to_synthesize is None: continue
+            # --- MODIFICATION: Get dictionary instead of string ---
+            chunk_to_synthesize = self.translation_queue.get()
+            if chunk_to_synthesize is None: continue
 
+            text_to_synthesize = chunk_to_synthesize['text']
+            speaker = chunk_to_synthesize['speaker']
+
+            # --- MODIFICATION: Dynamically select voice ---
+            # Fallback to speaker 1 if the tag is unexpected
+            voice_name = SPEAKER_VOICES.get(speaker, SPEAKER_VOICES[1])
+            
+            voice = texttospeech.VoiceSelectionParams(
+                language_code=self.target_language, name=voice_name
+            )
+            
             synthesis_input = texttospeech.SynthesisInput(text=text_to_synthesize)
             response = client.synthesize_speech(
                 input=synthesis_input, voice=voice, audio_config=audio_config
