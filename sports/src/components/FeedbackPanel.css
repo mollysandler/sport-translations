@@ -1,0 +1,134 @@
+.feedback-card {
+  background: white;
+  border-radius: 8px;
+  padding: 1.5rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.feedback-card h3 {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin-bottom: 1rem;
+}
+
+.feedback-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.form-group label {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: #333;
+}
+
+.star-rating {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.star {
+  width: 36px;
+  height: 36px;
+  border: none;
+  background: none;
+  font-size: 1.5rem;
+  cursor: pointer;
+  color: #ddd;
+  transition: all 0.2s;
+  padding: 0;
+}
+
+.star:hover {
+  color: #fbbf24;
+  transform: scale(1.1);
+}
+
+.star.filled {
+  color: #fbbf24;
+}
+
+.feedback-select {
+  padding: 0.75rem;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  font-size: 0.95rem;
+  background-color: white;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.feedback-select:hover {
+  border-color: #1e40af;
+}
+
+.feedback-select:focus {
+  outline: none;
+  border-color: #1e40af;
+  box-shadow: 0 0 0 3px rgba(30, 64, 175, 0.1);
+}
+
+.feedback-textarea {
+  padding: 0.75rem;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  font-size: 0.95rem;
+  font-family: inherit;
+  resize: vertical;
+  transition: all 0.2s;
+}
+
+.feedback-textarea:hover {
+  border-color: #1e40af;
+}
+
+.feedback-textarea:focus {
+  outline: none;
+  border-color: #1e40af;
+  box-shadow: 0 0 0 3px rgba(30, 64, 175, 0.1);
+}
+
+.submit-feedback-button {
+  padding: 0.75rem;
+  background-color: #1e40af;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.submit-feedback-button:hover {
+  background-color: #1e3a8a;
+}
+
+.submit-feedback-button:active {
+  transform: scale(0.98);
+}
+
+.feedback-success {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 2rem 1rem;
+  background-color: #f0fdf4;
+  border-radius: 6px;
+  color: #22c55e;
+}
+
+.success-icon {
+  font-size: 2rem;
+}
+
+.feedback-success p {
+  font-weight: 500;
+}

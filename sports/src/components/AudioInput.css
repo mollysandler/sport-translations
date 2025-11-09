@@ -1,0 +1,226 @@
+.audio-input-card {
+  background: white;
+  border-radius: 8px;
+  padding: 1.5rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.audio-input-card h2 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin-bottom: 1.5rem;
+}
+
+.input-method-tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1.5rem;
+  border-bottom: 2px solid #eee;
+}
+
+.tab-button {
+  padding: 0.75rem 1rem;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: #666;
+  border-bottom: 3px solid transparent;
+  transition: all 0.2s;
+  margin-bottom: -2px;
+}
+
+.tab-button:hover {
+  color: #1e40af;
+}
+
+.tab-button.active {
+  color: #1e40af;
+  border-bottom-color: #1e40af;
+}
+
+.input-method-content {
+  animation: fadeIn 0.2s ease-in;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.upload-section {
+  padding: 2rem;
+  background: #f9fafb;
+  border-radius: 6px;
+  border: 2px dashed #d1d5db;
+  text-align: center;
+}
+
+.file-input {
+  display: none;
+}
+
+.file-input-label {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+  cursor: pointer;
+}
+
+.upload-icon {
+  font-size: 2.5rem;
+}
+
+.file-input-label span:nth-child(2) {
+  font-size: 1rem;
+  font-weight: 500;
+  color: #333;
+}
+
+.upload-hint {
+  font-size: 0.875rem;
+  color: #999;
+}
+
+.stream-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.stream-input-group {
+  display: flex;
+  gap: 0.75rem;
+}
+
+.stream-input {
+  flex: 1;
+  padding: 0.75rem;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  font-size: 1rem;
+  transition: all 0.2s;
+}
+
+.stream-input:focus {
+  outline: none;
+  border-color: #1e40af;
+  box-shadow: 0 0 0 3px rgba(30, 64, 175, 0.1);
+}
+
+.submit-button {
+  padding: 0.75rem 1.5rem;
+  background-color: #1e40af;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.submit-button:hover {
+  background-color: #1e3a8a;
+}
+
+.submit-button:active {
+  transform: scale(0.98);
+}
+
+.stream-hint {
+  font-size: 0.875rem;
+  color: #999;
+  margin-top: -0.5rem;
+}
+
+.record-section {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+  padding: 2rem;
+}
+
+.record-button {
+  padding: 1rem 2rem;
+  font-size: 1rem;
+  font-weight: 600;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.record-button.start {
+  background-color: #dc2626;
+  color: white;
+}
+
+.record-button.start:hover {
+  background-color: #991b1b;
+}
+
+.record-button.stop {
+  background-color: #ea580c;
+  color: white;
+}
+
+.record-button.stop:hover {
+  background-color: #c2410c;
+}
+
+.recording-active {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+}
+
+.recording-indicator {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  font-size: 1rem;
+  font-weight: 600;
+  color: #dc2626;
+}
+
+.recording-dot {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  background-color: #dc2626;
+  border-radius: 50%;
+  animation: pulse 1s infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.record-hint {
+  font-size: 0.875rem;
+  color: #999;
+}
+
+@media (max-width: 640px) {
+  .stream-input-group {
+    flex-direction: column;
+  }
+
+  .upload-section {
+    padding: 1rem;
+  }
+}
