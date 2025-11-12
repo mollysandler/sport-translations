@@ -86,4 +86,12 @@ class SpeechTranslator:
             input=synthesis_input, voice=voice, audio_config=audio_config
         )
 
-        return tts_response.audio_content
+        original_text = stt_response.results[0].alternatives[0].transcript if stt_response.results else ""
+        translated_text = translation_response.translations[0].translated_text if translation_response.translations else ""
+
+        # Return a dictionary containing everything
+        return {
+            "original_text": original_text,
+            "translated_text": translated_text,
+            "audio_data": tts_response.audio_content
+}
