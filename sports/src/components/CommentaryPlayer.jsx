@@ -58,9 +58,16 @@ export default function CommentaryPlayer({
     return `${mins}:${secs.toString().padStart(2, "0")}`;
   };
 
-  const currentCaption = captions.find(
+  const activeCaptions = captions.filter(
     (c) => currentTime >= c.startTime && currentTime <= c.endTime
   );
+
+  const getSpeakerColor = (speaker) => {
+    // Simple hash to pick a color based on speaker number
+    const colors = ["#2563eb", "#dc2626", "#16a34a", "#d97706", "#9333ea"];
+    const num = parseInt(speaker.replace(/\D/g, "") || "0");
+    return colors[num % colors.length];
+  };
 
   return (
     <div className="player-card">
@@ -119,20 +126,50 @@ export default function CommentaryPlayer({
 
       <div className="commentary-display">
         <div className="commentary-box">
+          {/* ORIGINAL COLUMN */}
           <div className="commentary-section">
             <h4>Original ({sourceLanguage.toUpperCase()})</h4>
-            <p className="commentary-text">
-              {currentCaption ? currentCaption.original : "..."}
-            </p>
+            <div className="captions-list">
+              {activeCaptions.length > 0 ? (
+                activeCaptions.map((cap, index) => (
+                  <div key={index} className="caption-item">
+                    <span
+                      className="speaker-label"
+                      style={{ backgroundColor: getSpeakerColor(cap.speaker) }}
+                    >
+                      {cap.speaker}
+                    </span>
+                    <p>{cap.original}</p>
+                  </div>
+                ))
+              ) : (
+                <p className="placeholder-text">Waiting for commentary...</p>
+              )}
+            </div>
           </div>
 
           <div className="commentary-divider"></div>
 
+          {/* TRANSLATED COLUMN */}
           <div className="commentary-section">
             <h4>Translation ({targetLanguage.toUpperCase()})</h4>
-            <p className="commentary-text translated">
-              {currentCaption ? currentCaption.translated : "..."}
-            </p>
+            <div className="captions-list">
+              {activeCaptions.length > 0 ? (
+                activeCaptions.map((cap, index) => (
+                  <div key={index} className="caption-item">
+                    <span
+                      className="speaker-label"
+                      style={{ backgroundColor: getSpeakerColor(cap.speaker) }}
+                    >
+                      {cap.speaker}
+                    </span>
+                    <p className="translated-text">{cap.translated}</p>
+                  </div>
+                ))
+              ) : (
+                <p className="placeholder-text">Waiting for translation...</p>
+              )}
+            </div>
           </div>
         </div>
       </div>
