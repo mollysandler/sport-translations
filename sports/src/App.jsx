@@ -13,6 +13,18 @@ export default function App() {
   const [speakerGender, setSpeakerGender] = useState("male");
   const [audioInput, setAudioInput] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [captions, setCaptions] = useState([]);
+
+  const handleAudioSelected = (data) => {
+    setAudioInput(data);
+    // If the data contains captions (from backend), set them.
+    // Otherwise (e.g. stream/recording without translation yet), clear them.
+    if (data.captions) {
+      setCaptions(data.captions);
+    } else {
+      setCaptions([]);
+    }
+  };
 
   return (
     <div className="app-container">
@@ -36,12 +48,13 @@ export default function App() {
             <AudioInput
               sourceLanguage={sourceLanguage}
               targetLanguage={targetLanguage}
-              onAudioSelected={setAudioInput}
+              onAudioSelected={handleAudioSelected}
             />
 
             {audioInput && (
               <CommentaryPlayer
                 audioInput={audioInput}
+                captions={captions}
                 sourceLanguage={sourceLanguage}
                 targetLanguage={targetLanguage}
                 speakerGender={speakerGender}

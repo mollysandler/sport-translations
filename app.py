@@ -9,6 +9,7 @@ from flask_cors import CORS
 from pydub import AudioSegment
 from pyannote.audio import Pipeline
 import torch
+import base64
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -72,51 +73,52 @@ def translate_audio_endpoint():
         for turn, _, speaker in diarization.speaker_diarization.itertracks(yield_label=True):
             start_ms = int(turn.start * 1000)
             end_ms = int(turn.end * 1000)
+
+            # SKIPPING SHORT SEGMENTS, COULD BE A PROBLEM LATER
+            if (end_ms - start_ms) < 500:
+                print(f"   » Skipping short segment for {speaker} ({end_ms - start_ms}ms)")
+                continue
             
-            print(f"\nProcessing segment for {speaker} from {start_ms}ms to {end_ms}ms")
-            
+            # Extract segment
             segment_audio = full_original_audio[start_ms:end_ms]
             segment_wav_data = segment_audio.export(format="wav").read()
             
-            # We assume translate_audio_chunk now returns both audio and text
-            # You might need to adjust your SpeechTranslator for this
+            # Translate
             result = translator.translate_audio_chunk(
                 audio_chunk_data=segment_wav_data,
                 speaker_id=speaker
             )
 
-            # Let's assume the translator returns a dictionary:
-            # { "audio_data": <mp3_bytes>, "original_text": "...", "translated_text": "..." }
-            # For now, we'll mock the text part if it's not there.
-            
-            translated_audio_data = result.get("audio_data") if isinstance(result, dict) else result
-            
-            if translated_audio_data:
-                translated_segment = AudioSegment.from_file(io.BytesIO(translated_audio_data), format="mp3")
+            if result and result.get("audio_data"):
+                # Overlay audio
+                translated_segment = AudioSegment.from_file(io.BytesIO(result["audio_data"]), format="mp3")
                 final_composition = final_composition.overlay(translated_segment, position=start_ms)
                 
+                # Append to commentary data list
+                # WE KEEP TIMESTAMPS IN SECONDS FOR THE FRONTEND
                 commentary_data.append({
-                    "time": turn.start,
-                    "original": result.get("original_text", "Original text..."),
-                    "translated": result.get("translated_text", "Translated text...")
+                    "startTime": turn.start, 
+                    "endTime": turn.end,
+                    "speaker": speaker,
+                    "original": result.get("original_text", ""),
+                    "translated": result.get("translated_text", "")
                 })
-
 
         print("\n✅ All segments processed.")
         
-        # Instead of playing the file, we send it back
+        # Export final audio to bytes
         output_buffer = io.BytesIO()
         final_composition.export(output_buffer, format="mp3")
         output_buffer.seek(0)
         
-        # For now, we'll just send the audio. In a real app you might send JSON with a URL to the audio.
-        return send_file(
-            output_buffer,
-            mimetype="audio/mpeg",
-            as_attachment=True,
-            download_name="translated_commentary.mp3"
-        )
-        # --- END OF CORE LOGIC ---
+        # Encode audio to Base64 string
+        audio_base64 = base64.b64encode(output_buffer.read()).decode('utf-8')
+        
+        # Return JSON containing BOTH audio and captions
+        return jsonify({
+            "audio_base64": audio_base64,
+            "captions": commentary_data
+        })
 
     except Exception as e:
         import traceback

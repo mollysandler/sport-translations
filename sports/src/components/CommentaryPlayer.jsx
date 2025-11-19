@@ -1,10 +1,11 @@
-"use client"
+"use client";
 
-import { useState, useRef, useEffect } from "react"
-import "./CommentaryPlayer.css"
+import { useState, useRef, useEffect } from "react";
+import "./CommentaryPlayer.css";
 
 export default function CommentaryPlayer({
   audioInput,
+  captions = [],
   sourceLanguage,
   targetLanguage,
   speakerGender,
@@ -12,57 +13,54 @@ export default function CommentaryPlayer({
   isPlaying,
   onPlayingChange,
 }) {
-  const audioRef = useRef(null)
-  const [currentTime, setCurrentTime] = useState(0)
-  const [duration, setDuration] = useState(0)
-  const [mockCommentary, setMockCommentary] = useState([
-    { time: 0, original: "Welcome to today's match", translated: "Bienvenido al partido de hoy" },
-    { time: 5, original: "The home team takes the field", translated: "El equipo local toma el campo" },
-    { time: 10, original: "What an incredible pass!", translated: "¡Qué pase increíble!" },
-  ])
+  const audioRef = useRef(null);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
 
   useEffect(() => {
-    const audio = audioRef.current
-    if (!audio) return
+    const audio = audioRef.current;
+    if (!audio) return;
 
-    const handlePlay = () => onPlayingChange(true)
-    const handlePause = () => onPlayingChange(false)
-    const handleTimeUpdate = () => setCurrentTime(audio.currentTime)
-    const handleLoadedMetadata = () => setDuration(audio.duration)
+    const handlePlay = () => onPlayingChange(true);
+    const handlePause = () => onPlayingChange(false);
+    const handleTimeUpdate = () => setCurrentTime(audio.currentTime);
+    const handleLoadedMetadata = () => setDuration(audio.duration);
 
-    audio.addEventListener("play", handlePlay)
-    audio.addEventListener("pause", handlePause)
-    audio.addEventListener("timeupdate", handleTimeUpdate)
-    audio.addEventListener("loadedmetadata", handleLoadedMetadata)
+    audio.addEventListener("play", handlePlay);
+    audio.addEventListener("pause", handlePause);
+    audio.addEventListener("timeupdate", handleTimeUpdate);
+    audio.addEventListener("loadedmetadata", handleLoadedMetadata);
 
     return () => {
-      audio.removeEventListener("play", handlePlay)
-      audio.removeEventListener("pause", handlePause)
-      audio.removeEventListener("timeupdate", handleTimeUpdate)
-      audio.removeEventListener("loadedmetadata", handleLoadedMetadata)
-    }
-  }, [onPlayingChange])
+      audio.removeEventListener("play", handlePlay);
+      audio.removeEventListener("pause", handlePause);
+      audio.removeEventListener("timeupdate", handleTimeUpdate);
+      audio.removeEventListener("loadedmetadata", handleLoadedMetadata);
+    };
+  }, [onPlayingChange]);
 
   const togglePlay = () => {
     if (audioRef.current) {
-      isPlaying ? audioRef.current.pause() : audioRef.current.play()
+      isPlaying ? audioRef.current.pause() : audioRef.current.play();
     }
-  }
+  };
 
   const handleProgressChange = (e) => {
     if (audioRef.current) {
-      audioRef.current.currentTime = Number.parseFloat(e.target.value)
+      audioRef.current.currentTime = Number.parseFloat(e.target.value);
     }
-  }
+  };
 
   const formatTime = (seconds) => {
-    if (!seconds || isNaN(seconds)) return "0:00"
-    const mins = Math.floor(seconds / 60)
-    const secs = Math.floor(seconds % 60)
-    return `${mins}:${secs.toString().padStart(2, "0")}`
-  }
+    if (!seconds || isNaN(seconds)) return "0:00";
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${mins}:${secs.toString().padStart(2, "0")}`;
+  };
 
-  const currentCommentary = mockCommentary.find((c) => c.time <= currentTime && currentTime < c.time + 5)
+  const currentCaption = captions.find(
+    (c) => currentTime >= c.startTime && currentTime <= c.endTime
+  );
 
   return (
     <div className="player-card">
@@ -106,7 +104,9 @@ export default function CommentaryPlayer({
           {["male", "female", "mixed"].map((gender) => (
             <button
               key={gender}
-              className={`gender-button ${speakerGender === gender ? "active" : ""}`}
+              className={`gender-button ${
+                speakerGender === gender ? "active" : ""
+              }`}
               onClick={() => onSpeakerGenderChange(gender)}
             >
               {gender === "male" && "♂ Male"}
@@ -122,7 +122,7 @@ export default function CommentaryPlayer({
           <div className="commentary-section">
             <h4>Original ({sourceLanguage.toUpperCase()})</h4>
             <p className="commentary-text">
-              {currentCommentary ? currentCommentary.original : "Waiting for commentary..."}
+              {currentCaption ? currentCaption.original : "..."}
             </p>
           </div>
 
@@ -131,11 +131,11 @@ export default function CommentaryPlayer({
           <div className="commentary-section">
             <h4>Translation ({targetLanguage.toUpperCase()})</h4>
             <p className="commentary-text translated">
-              {currentCommentary ? currentCommentary.translated : "Waiting for translation..."}
+              {currentCaption ? currentCaption.translated : "..."}
             </p>
           </div>
         </div>
       </div>
     </div>
-  )
+  );
 }

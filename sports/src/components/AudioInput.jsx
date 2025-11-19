@@ -30,16 +30,25 @@ export default function AudioInput({
         throw new Error("Network response was not ok");
       }
 
-      // The backend sends back the translated audio file
-      const translatedAudioBlob = await response.blob();
-      const translatedAudioUrl = URL.createObjectURL(translatedAudioBlob);
+      // 1. Parse JSON instead of blob()
+      const data = await response.json();
 
-      // We now pass the NEW translated audio URL to the player
+      // 2. Convert Base64 audio string back to a Blob
+      const binaryString = window.atob(data.audio_base64);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      const audioBlobResponse = new Blob([bytes], { type: "audio/mp3" });
+      const translatedAudioUrl = URL.createObjectURL(audioBlobResponse);
+
+      // 3. Pass Audio AND Captions to parent
       onAudioSelected({
-        type: "file", // Or whatever type is appropriate
-        source: translatedAudioUrl, // This is the key change
+        type: "file",
+        source: translatedAudioUrl,
         name: `Translated - ${fileName}`,
         timestamp: new Date(),
+        captions: data.captions, // <--- Passing the captions here
       });
     } catch (error) {
       console.error("Error translating audio:", error);

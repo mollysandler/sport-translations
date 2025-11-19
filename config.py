@@ -10,7 +10,7 @@
 SOURCE_LANGUAGE = "en-US"
 
 # The default language to translate into (e.g., "es-ES", "fr-FR", "hi-IN")
-TARGET_LANGUAGE = "hi-IN"
+TARGET_LANGUAGE = "es-ES"
 
 
 # --- Audio Configuration ---
