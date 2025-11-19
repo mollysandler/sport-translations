@@ -19,6 +19,8 @@ export default function AudioInput({
     setIsLoading(true);
     const formData = new FormData();
     formData.append("audio", audioBlob, fileName);
+    formData.append("source_lang", sourceLanguage);
+    formData.append("target_lang", targetLanguage);
 
     try {
       const response = await fetch("http://127.0.0.1:5000/translate-audio", {

@@ -6,11 +6,31 @@
 # # Text-to-Speech: https://cloud.google.com/text-to-speech/docs/voices
 # # Translation: https://cloud.google.com/translate/docs/languages
 
-# The language of the original sports commentary (e.g., "en-US", "es-ES")
-SOURCE_LANGUAGE = "en-US"
+# # The language of the original sports commentary (e.g., "en-US", "es-ES")
+# SOURCE_LANGUAGE = "en-US"
 
-# The default language to translate into (e.g., "es-ES", "fr-FR", "hi-IN")
-TARGET_LANGUAGE = "es-ES"
+# # The default language to translate into (e.g., "es-ES", "fr-FR", "hi-IN")
+# TARGET_LANGUAGE = "es-ES"
+
+# --- Language Mapping ---
+# Maps frontend short codes to Google Cloud BCP-47 codes.
+# Add more languages here as needed.
+LANGUAGE_MAPPING = {
+    "en": "en-US",
+    "es": "es-ES",
+    "fr": "fr-FR",
+    "hi": "hi-IN",
+    "de": "de-DE",
+    "it": "it-IT",
+    "pt": "pt-BR",
+    "ja": "ja-JP",
+    "ko": "ko-KR",
+    "zh": "zh-CN"
+}
+
+# Default fallbacks
+DEFAULT_SOURCE = "en-US"
+DEFAULT_TARGET = "hi-IN"
 
 
 # --- Audio Configuration ---

@@ -1,24 +1,22 @@
-# app.py
-
 import os
 import io
 import tempfile
 import shutil
+import base64 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from pydub import AudioSegment
 from pyannote.audio import Pipeline
 import torch
-import base64
 from dotenv import load_dotenv
 load_dotenv()
 
 from translator import SpeechTranslator
-from config import TARGET_LANGUAGE, STT_SAMPLE_RATE
+# --- CHANGE 1: Update Imports to match new config.py ---
+from config import STT_SAMPLE_RATE, LANGUAGE_MAPPING, DEFAULT_SOURCE, DEFAULT_TARGET
 
 # 1. --- SETUP FLASK APP ---
 app = Flask(__name__)
-# Allow requests from your React app's origin (e.g., http://localhost:5173)
 CORS(app)
 
 # 2. --- LOAD MODELS ONCE AT STARTUP ---
@@ -35,10 +33,6 @@ device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 pipeline.to(device)
 print("✅ Diarization pipeline loaded.")
 
-translator = SpeechTranslator(target_language=TARGET_LANGUAGE)
-print("✅ SpeechTranslator initialized.")
-
-
 # 3. --- CREATE THE API ENDPOINT ---
 @app.route('/translate-audio', methods=['POST'])
 def translate_audio_endpoint():
@@ -47,8 +41,18 @@ def translate_audio_endpoint():
         return jsonify({"error": "No audio file part"}), 400
 
     file = request.files['audio']
+    
+    raw_source = request.form.get('source_lang', 'en')
+    raw_target = request.form.get('target_lang', 'hi')
+
+    # Map to BCP-47 codes (e.g., "en" -> "en-US")
+    source_lang = LANGUAGE_MAPPING.get(raw_source, DEFAULT_SOURCE)
+    target_lang = LANGUAGE_MAPPING.get(raw_target, DEFAULT_TARGET)
+
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
+    
+    print(f"🌍 Request: Translating {source_lang} -> {target_lang}")
 
     temp_dir = tempfile.mkdtemp()
     try:
@@ -59,7 +63,9 @@ def translate_audio_endpoint():
                     format="wav",
                     parameters=["-ar", str(STT_SAMPLE_RATE), "-ac", "1"])
 
-        # --- THIS IS YOUR CORE LOGIC FROM main.py ---
+        
+        translator = SpeechTranslator(source_language=source_lang, target_language=target_lang)
+
         print("DIARIZING: Identifying speakers in the audio...")
         diarization = pipeline(temp_audio_path)
         print("✅ Diarization complete.")
