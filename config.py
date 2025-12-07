@@ -36,8 +36,8 @@ SAMPLE_RATE = 16000  # Required by both Pyannote and SeamlessM4T
 # --- Diarization Configuration ---
 MIN_SPEAKERS = 2  # Minimum speakers (for sports commentary)
 MAX_SPEAKERS = 4  # Maximum speakers
-MIN_SEGMENT_DURATION_MS = 500  # Skip segments shorter than this
-SPEAKER_MERGE_GAP_SECONDS = 0.3  # Merge segments from same speaker within this gap
+MIN_SEGMENT_DURATION_MS = 100  # Skip segments shorter than this
+SPEAKER_MERGE_GAP_SECONDS = 1.0  # Merge segments from same speaker within this gap
 
 # --- Model Configuration ---
 SEAMLESS_MODEL = "facebook/seamless-m4t-v2-large"
