@@ -343,10 +343,6 @@ paket-files/
 **/__pycache__/
 *.pyc
 
-# Cake - Uncomment if you are using it
-#tools/**
-#!tools/packages.config
-
 # Tabs Studio
 *.tss
 
@@ -418,6 +414,8 @@ FodyWeavers.xsd
 *.msp
 
 
+venv_v3/
+.venv_v3/
 
 # google stuff
 google_keys.json

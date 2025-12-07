@@ -1,14 +1,28 @@
-google-cloud-speech
-google-cloud-texttospeech
-google-cloud-translate
-pydub
-sounddevice
-numpy
-python-dotenv
-moviepy==1.0.3
-soundfile
-torch
-torchaudio
-# New requirements for speaker diarization
+# requirements.txt
+# Requirements for SeamlessM4T-based translation system (HuggingFace version)
+
+# Core ML frameworks
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# HuggingFace Transformers (includes SeamlessM4T)
+transformers>=4.35.0
+sentencepiece
+accelerate
+scipy
+
+# Speaker diarization
 pyannote.audio
 huggingface-hub
+
+# Audio processing
+pydub
+soundfile
+moviepy==1.0.3
+
+# Utilities
+python-dotenv
+numpy
+
+# Optional: For better audio device support
+sounddevice
