@@ -26,3 +26,8 @@ numpy
 
 # Optional: For better audio device support
 sounddevice
+
+openai-whisper
+bark
+nltk
+librosa

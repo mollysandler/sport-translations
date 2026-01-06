@@ -416,6 +416,14 @@ FodyWeavers.xsd
 
 venv_v3/
 .venv_v3/
+.venv4/
+venv4/
 
 # google stuff
 google_keys.json
+
+# temp video stuff 
+temp_*.wav
+translated_*.wav
+pretrained_models
+*.mp4

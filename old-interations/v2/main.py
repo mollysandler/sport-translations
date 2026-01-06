@@ -14,8 +14,8 @@ from pydub import AudioSegment
 from pydub.playback import play
 from pyannote.audio import Pipeline
 
-from translator import SpeechTranslator
-from config import TARGET_LANGUAGE, STT_SAMPLE_RATE
+from v3.translator import SpeechTranslator
+from hybrid_config import TARGET_LANGUAGE, STT_SAMPLE_RATE
 
 # Load .env file for credentials
 load_dotenv()

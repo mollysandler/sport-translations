@@ -12,7 +12,7 @@ from pydub import AudioSegment
 from pydub.playback import play
 from google.cloud import speech, texttospeech, translate_v2 as translate
 
-from config import SOURCE_LANGUAGE, TARGET_LANGUAGE, RATE, CHUNK
+from hybrid_config import SOURCE_LANGUAGE, TARGET_LANGUAGE, RATE, CHUNK
 
 load_dotenv()
 

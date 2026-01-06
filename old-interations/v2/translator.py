@@ -3,7 +3,7 @@
 import io
 from google.cloud import speech, texttospeech, translate
 from google.api_core.exceptions import GoogleAPICallError
-from config import GOOGLE_PROJECT_ID
+from hybrid_config import GOOGLE_PROJECT_ID
 
 # --- OPTIMIZATION: Initialize Clients Globally ---
 # Creating these clients is expensive, so we do it once and reuse them.

@@ -11,9 +11,9 @@ import torch
 from dotenv import load_dotenv
 load_dotenv()
 
-from translator import SpeechTranslator
+from v3.translator import SpeechTranslator
 # --- CHANGE 1: Update Imports to match new config.py ---
-from config import STT_SAMPLE_RATE, LANGUAGE_MAPPING, DEFAULT_SOURCE, DEFAULT_TARGET
+from hybrid_config import STT_SAMPLE_RATE, LANGUAGE_MAPPING, DEFAULT_SOURCE, DEFAULT_TARGET
 
 # 1. --- SETUP FLASK APP ---
 app = Flask(__name__)

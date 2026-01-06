@@ -6,6 +6,7 @@ from typing import List, Dict
 from dataclasses import dataclass
 import numpy as np
 
+# Fix PyTorch 2.8 - add ALL pyannote safe globals
 import torch.serialization
 from pyannote.audio.core.task import Specifications, Problem, Resolution
 torch.serialization.add_safe_globals([
@@ -15,7 +16,7 @@ torch.serialization.add_safe_globals([
     Resolution,
 ])
 
-from config import (
+from hybrid_config import (
     MIN_SPEAKERS,
     MAX_SPEAKERS,
     MIN_SEGMENT_DURATION_MS,
@@ -39,7 +40,7 @@ class SpeakerDiarizer:
         print("🔊 Loading speaker diarization pipeline...")
         self.pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
-            use_auth_token=hf_token
+            token=hf_token
         )
         device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
         self.pipeline.to(device)
@@ -72,11 +73,15 @@ class SpeakerDiarizer:
         diarization = self.pipeline(
             audio_in_memory,
             min_speakers=MIN_SPEAKERS,
-            max_speakers=MAX_SPEAKERS
+            max_speakers=MAX_SPEAKERS,
+            # These help with speaker separation:
+            segmentation_onset=0.5,  # Lower = more sensitive to speaker changes
+            segmentation_offset=0.5,
+            clustering="AgglomerativeClustering",  # More accurate than default
         )
-                
+        
         segments = []
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
+        for turn, _, speaker in diarization.speaker_diarization.itertracks(yield_label=True):
             segment = SpeakerSegment(
                 speaker_id=speaker,
                 start_ms=int(turn.start * 1000),

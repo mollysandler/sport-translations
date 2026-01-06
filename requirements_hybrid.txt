@@ -1,0 +1,61 @@
+# requirements_hybrid.txt
+# Streamlined requirements with compatible versions
+
+# First, upgrade pip
+# Run: pip install --upgrade pip
+
+# Core dependencies - install these first
+numpy<2.0.0
+scipy<1.14.0
+
+# PyTorch (choose based on your system)
+# For Mac (MPS/CPU):
+torch>=2.0.0,<2.5.0
+torchaudio>=2.0.0,<2.5.0
+
+# For CUDA 11.8:
+# torch>=2.0.0,<2.5.0+cu118
+# torchaudio>=2.0.0,<2.5.0+cu118
+
+# Audio processing (before librosa to avoid conflicts)
+soundfile>=0.12.0
+audioread>=3.0.0
+soxr>=0.3.0
+
+# Faster Whisper
+faster-whisper>=0.10.0,<1.1.0
+
+# HuggingFace ecosystem
+transformers>=4.35.0,<4.46.0
+sentencepiece>=0.1.99
+tokenizers>=0.15.0
+huggingface-hub>=0.19.0
+accelerate>=0.25.0
+
+# Coqui TTS
+TTS>=0.22.0,<0.23.0
+
+# SpeechBrain for speaker embeddings
+speechbrain>=0.5.16,<1.1.0
+
+# Speaker diarization
+pyannote.audio>=3.1.0,<3.4.0
+
+# Audio utilities
+pydub>=0.25.0
+librosa>=0.10.0,<0.11.0
+
+# Video processing
+moviepy>=1.0.3,<2.1.0
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.9
+
+# Google Cloud (optional - for fallback translation)
+google-cloud-translate>=3.12.0,<4.0.0
+
+# Utilities
+python-dotenv>=1.0.0
+protobuf>=3.20.0,<5.0.0
+
+# Optional: For live streaming
+sounddevice>=0.4.6

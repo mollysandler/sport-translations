@@ -6,7 +6,7 @@ from pydub import AudioSegment
 from pydub.playback import play
 
 # --- NEW: Import language settings from your config file ---
-from config import TARGET_LANGUAGE
+from hybrid_config import TARGET_LANGUAGE
 
 # --- NEW: Load environment variables from .env file ---
 # This line looks for a .env file and loads the variables from it,
