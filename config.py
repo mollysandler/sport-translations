@@ -38,8 +38,8 @@ MIN_SPEAKERS = 1
 MAX_SPEAKERS = 3  # Good default for interviews + commentary
 # We can be sensitive again because this ONLY affects speaker labeling,
 # not text accuracy.
-MIN_SEGMENT_DURATION_MS = 500  # Catch "Why not?"
-SPEAKER_MERGE_GAP_SECONDS = 0.5 # Reasonable balance
+MIN_SEGMENT_DURATION_MS = 300  # Catch "Why not?"
+SPEAKER_MERGE_GAP_SECONDS = 0.3 # Reasonable balance
 
 # --- Model Configuration ---
 SEAMLESS_MODEL = "facebook/seamless-m4t-v2-large"

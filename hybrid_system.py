@@ -45,7 +45,7 @@ class HybridSportsTranslator:
     def __init__(
         self,
         source_lang: str = "en",
-        target_lang: str = "es",
+        target_lang: str = "hi",
         analysis_duration_sec: int = 30,
         chunk_duration_sec: float = 2.0
     ):
@@ -335,26 +335,32 @@ class HybridSportsTranslator:
     ) -> Optional[TranslationSegment]:
         """Process a single audio chunk"""
         
-        # 1. Check if there's speech (VAD)
-        if self._is_silence(chunk):
+        # Get energy for debugging
+        energy = torch.abs(chunk).mean().item()
+        
+        # 1. Check if truly silent (very low threshold)
+        if energy < 0.001:  # Only skip completely silent chunks
+            print(f"[Chunk {chunk_num}] Skipped (completely silent, energy={energy:.5f})")
             return None
         
         # 2. Identify speaker
         speaker_id = self._identify_speaker(chunk)
         
-        # 3. Transcribe
+        # 3. Transcribe - let Whisper handle everything
         chunk_np = chunk.squeeze().numpy()
         segments, info = self.whisper.transcribe(
             chunk_np,
             language=self.source_lang,
             beam_size=1,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500)
+            vad_filter=False,
+            condition_on_previous_text=False,
+            word_timestamps=False
         )
         
         # Combine all text from this chunk
         text_parts = [seg.text.strip() for seg in segments if seg.text.strip()]
         if not text_parts:
+            print(f"[Chunk {chunk_num}] Skipped (no transcription, energy={energy:.5f})")
             return None
         
         original_text = " ".join(text_parts)
@@ -373,7 +379,7 @@ class HybridSportsTranslator:
         duration_ms = len(audio_segment)
         
         # Progress indicator
-        print(f"[Chunk {chunk_num}] {speaker_id}: \"{translated_text[:60]}...\"")
+        print(f"[Chunk {chunk_num}] {speaker_id}: \"{original_text}\" → \"{translated_text[:60]}...\"")
         
         return TranslationSegment(
             speaker_id=speaker_id,
@@ -385,7 +391,7 @@ class HybridSportsTranslator:
             duration_ms=duration_ms
         )
     
-    def _is_silence(self, chunk: torch.Tensor, threshold: float = 0.01) -> bool:
+    def _is_silence(self, chunk: torch.Tensor, threshold: float = 0.003) -> bool:
         """Check if audio chunk is mostly silence"""
         energy = torch.abs(chunk).mean().item()
         return energy < threshold
@@ -505,8 +511,15 @@ class HybridSportsTranslator:
             
             # Calculate timing with relative sync
             original_gap_ms = seg.start_ms - prev_original_end_ms
-            ideal_start_ms = prev_translated_end_ms + original_gap_ms
-            actual_start_ms = max(seg.start_ms, ideal_start_ms)
+            
+            # For very small or negative gaps (overlaps), use minimal separation
+            if original_gap_ms < 200:  # Less than 200ms gap
+                # Place immediately after previous with small buffer
+                actual_start_ms = prev_translated_end_ms + 100
+            else:
+                # Preserve the gap
+                ideal_start_ms = prev_translated_end_ms + original_gap_ms
+                actual_start_ms = max(seg.start_ms, ideal_start_ms)
             
             # Extend canvas if needed
             required_length = actual_start_ms + seg.duration_ms
@@ -539,12 +552,12 @@ def main():
     """Command-line interface"""
     if len(sys.argv) < 2:
         print("Usage: python hybrid_system.py <video_path> [source_lang] [target_lang]")
-        print("\nExample: python hybrid_system.py video.mp4 en es")
+        print("\nExample: python hybrid_system.py video.mp4 en hi")
         sys.exit(1)
     
     video_path = sys.argv[1]
     source_lang = sys.argv[2] if len(sys.argv) > 2 else "en"
-    target_lang = sys.argv[3] if len(sys.argv) > 3 else "es"
+    target_lang = sys.argv[3] if len(sys.argv) > 3 else "hi"
     
     if not os.path.exists(video_path):
         print(f"❌ File not found: {video_path}")
