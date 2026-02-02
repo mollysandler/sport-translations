@@ -418,6 +418,8 @@ venv_v3/
 .venv_v3/
 .venv4/
 venv4/
+venv_final/
+venv_mac/
 
 # google stuff
 google_keys.json

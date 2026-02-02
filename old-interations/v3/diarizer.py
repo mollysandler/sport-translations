@@ -9,12 +9,6 @@ import numpy as np
 # Fix PyTorch 2.8 - add ALL pyannote safe globals
 import torch.serialization
 from pyannote.audio.core.task import Specifications, Problem, Resolution
-torch.serialization.add_safe_globals([
-    torch.torch_version.TorchVersion,
-    Specifications,
-    Problem,
-    Resolution,
-])
 
 from hybrid_config import (
     MIN_SPEAKERS,

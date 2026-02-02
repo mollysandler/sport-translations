@@ -16,14 +16,6 @@ SEAMLESS_LANGUAGE_MAPPING = {
     "zh": "cmn",
     "ar": "arb",
     "ru": "rus",
-    "tr": "tur",
-    "pl": "pol",
-    "nl": "nld",
-    "sv": "swe",
-    "da": "dan",
-    "no": "nob",
-    "fi": "fin",
-    "cs": "ces",
 }
 
 # Default languages
