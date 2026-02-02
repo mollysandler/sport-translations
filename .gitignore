@@ -414,6 +414,7 @@ FodyWeavers.xsd
 *.msp
 
 
+.venv/
 venv_v3/
 .venv_v3/
 .venv4/

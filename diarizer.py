@@ -36,7 +36,7 @@ class SpeakerDiarizer:
         # FIX: Explicitly passing token=hf_token using the new 'token' keyword
         self.pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
-            token=hf_token
+            use_auth_token=hf_token
         )
         
         device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
