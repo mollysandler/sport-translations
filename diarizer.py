@@ -9,7 +9,7 @@ from huggingface_hub import login
 
 # Configuration defaults
 MIN_SPEAKERS = 1
-MAX_SPEAKERS = 3
+MAX_SPEAKERS = 20
 MIN_SEGMENT_DURATION_MS = 300
 SPEAKER_MERGE_GAP_SECONDS = 0.3
 
@@ -33,11 +33,18 @@ class SpeakerDiarizer:
             # Login globally to resolve authentication for internal calls
             login(token=hf_token)
 
-        # FIX: Explicitly passing token=hf_token using the new 'token' keyword
-        self.pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            use_auth_token=hf_token
-        )
+        try:
+            # pyannote.audio 3.x expects use_auth_token
+            self.pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=hf_token,
+            )
+        except TypeError:
+            # some older variants used token=
+            self.pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                token=hf_token,
+            )
         
         device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
         self.pipeline.to(device)

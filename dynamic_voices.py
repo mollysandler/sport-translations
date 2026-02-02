@@ -13,6 +13,8 @@ import threading
 import queue
 import time
 import io
+import hashlib
+from scipy.io.wavfile import write as write_wav
 import torch
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
@@ -57,7 +59,7 @@ class SmartVoiceManager:
     
     def __init__(self, use_voice_cloning: bool = False):
         self.use_voice_cloning = use_voice_cloning
-        
+
         # Comprehensive ElevenLabs voice library with characteristics
         self.available_voices = {
             # Female voices
@@ -353,6 +355,89 @@ class SmartVoiceManager:
         return {sid: profile.voice_id for sid, profile in self.assigned_voices.items()}
 
 
+
+
+# === Voice cloning backends ===
+QWEN_LANG_NAME = {
+    "zh": "Chinese",
+    "en": "English",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "de": "German",
+    "fr": "French",
+    "ru": "Russian",
+    "pt": "Portuguese",
+    "es": "Spanish",
+    "it": "Italian",
+}
+
+def _wav_bytes_from_audio_np(audio_np: np.ndarray, sample_rate: int) -> bytes:
+    """Convert float/np audio array to 16-bit PCM WAV bytes."""
+    if audio_np.ndim > 1:
+        audio_np = audio_np.squeeze()
+    if audio_np.dtype != np.int16:
+        max_val = float(np.max(np.abs(audio_np))) if audio_np.size else 0.0
+        if max_val > 0:
+            audio_np = audio_np / max_val
+        audio_i16 = (audio_np * 32767).astype(np.int16)
+    else:
+        audio_i16 = audio_np
+    bio = io.BytesIO()
+    write_wav(bio, sample_rate, audio_i16)
+    bio.seek(0)
+    return bio.read()
+
+
+class QwenLocalVoiceCloner:
+    """Optional local Qwen3-TTS voice cloning via `qwen-tts` package."""
+    def __init__(self, model_id: str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base", device: str = "cpu"):
+        self.available = False
+        self.model = None
+        self.model_id = model_id
+        self.device = device
+
+        try:
+            from qwen_tts import Qwen3TTSModel
+            # Qwen examples use device_map like 'cuda:0'. On macOS, 'cpu' is safest.
+            device_map = device
+            self.model = Qwen3TTSModel.from_pretrained(
+                model_id,
+                device_map=device_map,
+            )
+            self.available = True
+        except Exception as e:
+            print(f"   ⚠️  Qwen local voice cloning unavailable: {e}")
+            self.available = False
+
+    def supports_lang(self, target_lang_iso: str) -> bool:
+        return target_lang_iso in QWEN_LANG_NAME
+
+    def create_prompt(self, ref_audio_np: np.ndarray, ref_sr: int, ref_text: str):
+        if not self.available:
+            return None
+        try:
+            return self.model.create_voice_clone_prompt(
+                ref_audio=(ref_audio_np, ref_sr),
+                ref_text=ref_text,
+                x_vector_only_mode=not bool(ref_text.strip()),
+            )
+        except Exception as e:
+            print(f"   ⚠️  Qwen create prompt failed: {e}")
+            return None
+
+    def synthesize(self, text: str, target_lang_iso: str, prompt_items):
+        if not self.available or prompt_items is None:
+            return None
+        try:
+            wavs, sr = self.model.generate_voice_clone(
+                text=text,
+                language=QWEN_LANG_NAME[target_lang_iso],
+                voice_clone_prompt=prompt_items,
+            )
+            return _wav_bytes_from_audio_np(np.array(wavs[0]), int(sr))
+        except Exception as e:
+            print(f"   ⚠️  Qwen synth failed: {e}")
+            return None
 class DynamicSpeakerTranslator:
     """
     Translator with dynamic speaker support
@@ -372,6 +457,12 @@ class DynamicSpeakerTranslator:
         self.sample_rate = 16000
         self.max_workers = max_workers
         self.use_voice_cloning = use_voice_cloning
+
+        # Speaker -> cloned voice ids / prompts (persist for the full run)
+        self.speaker_clone_voice_ids: Dict[str, str] = {}
+        self.speaker_ref_wav: Dict[str, bytes] = {}
+        self.speaker_ref_text: Dict[str, str] = {}
+        self.speaker_qwen_prompt: Dict[str, object] = {}
         
         # Initialize services
         self._initialize_services()
@@ -444,7 +535,19 @@ class DynamicSpeakerTranslator:
             use_speaker_boost=True
         )
         print("   ✅ ElevenLabs ready")
-        
+
+        # 4. Optional Qwen local voice cloning (disabled by default on M1 unless you enable it)
+        self.qwen_cloner = None
+        if os.getenv("QWEN_TTS_ENABLE", "0") == "1":
+            print("   🗣️  Loading Qwen3-TTS (local voice cloning)...")
+            qwen_device = os.getenv("QWEN_TTS_DEVICE", "cpu")  # 'cpu' is safest on macOS
+            qwen_model_id = os.getenv("QWEN_TTS_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+            self.qwen_cloner = QwenLocalVoiceCloner(model_id=qwen_model_id, device=qwen_device)
+            if self.qwen_cloner.available:
+                print("   ✅ Qwen3-TTS ready (local)")
+            else:
+                self.qwen_cloner = None
+
         print(f"✅ All services ready | Parallel workers: {self.max_workers}\n")
     
     def translate_video_streaming(
@@ -479,12 +582,19 @@ class DynamicSpeakerTranslator:
         
         speaker_segments = self._get_speaker_segments(audio, audio_path, hf_token)
         
-        # Smart voice assignment
-        self.speaker_voice_ids = self.voice_manager.assign_voices(
-            audio, 
-            speaker_segments, 
-            self.sample_rate
-        )
+        # Speaker -> voice mapping
+        if self.use_voice_cloning:
+            # Create true voice clones so each diarized speaker sounds like themselves.
+            self.speaker_voice_ids = self._create_speaker_voice_clones(
+                audio, speaker_segments, self.sample_rate
+            )
+        else:
+            # Legacy behavior: pick a pleasant stock voice per speaker.
+            self.speaker_voice_ids = self.voice_manager.assign_voices(
+                audio, 
+                speaker_segments, 
+                self.sample_rate
+            )
         
         # Calculate buffer
         buffer_duration = 0
@@ -546,7 +656,13 @@ class DynamicSpeakerTranslator:
     def _extract_audio(self, video_path: str) -> str:
         """Extract audio"""
         print(f"🎬 Extracting audio from '{Path(video_path).name}'...")
-        from moviepy import VideoFileClip
+        try:
+            # MoviePy v2+
+            from moviepy import VideoFileClip
+        except ImportError:
+            # MoviePy v1
+            from moviepy.editor import VideoFileClip
+
         
         temp_audio = "temp_extracted_audio.wav"
         video = VideoFileClip(video_path)
@@ -557,6 +673,90 @@ class DynamicSpeakerTranslator:
         video.close()
         return temp_audio
     
+    def _create_speaker_voice_clones(
+        self,
+        audio: torch.Tensor,
+        segments: List[SpeakerSegment],
+        sample_rate: int
+    ) -> Dict[str, str]:
+        """Create one cloned voice per diarized speaker (ElevenLabs IVC), plus optional Qwen prompts.
+
+        Returns: {speaker_id: elevenlabs_voice_id}
+        """
+        unique_speakers = sorted(set(seg.speaker_id for seg in segments))
+        print(f"\n🧬 Creating voice clones for {len(unique_speakers)} speakers...")
+
+        from io import BytesIO
+
+        for speaker_id in unique_speakers:
+            speaker_segments = [s for s in segments if s.speaker_id == speaker_id]
+
+            collected = []
+            total = 0.0
+            target = float(os.getenv("CLONE_REF_SECONDS", "15"))
+
+            for seg in speaker_segments:
+                if total >= target:
+                    break
+                start_sample = int(seg.start_sec * sample_rate)
+                end_sample = int(seg.end_sec * sample_rate)
+                seg_audio = audio[:, start_sample:end_sample]
+                seg_dur = (end_sample - start_sample) / sample_rate
+                if seg_dur >= 1.0:
+                    collected.append(seg_audio)
+                    total += seg_dur
+
+            if not collected:
+                print(f"   ⚠️  {speaker_id}: insufficient audio for cloning; will fall back to default voices.")
+                continue
+
+            combined = torch.cat(collected, dim=1)
+            max_samples = int(target * sample_rate)
+            if combined.shape[1] > max_samples:
+                combined = combined[:, :max_samples]
+
+            ref_np = combined.squeeze().cpu().numpy().astype(np.float32)
+            ref_wav_bytes = _wav_bytes_from_audio_np(ref_np, sample_rate)
+            self.speaker_ref_wav[speaker_id] = ref_wav_bytes
+
+            # Reference transcript (helps Qwen quality; optional)
+            ref_text = ""
+            try:
+                segs, _ = self.whisper.transcribe(
+                    ref_np,
+                    language=self.source_lang,
+                    beam_size=1,
+                    vad_filter=False,
+                    condition_on_previous_text=False
+                )
+                parts = [s.text.strip() for s in segs if s.text.strip()]
+                ref_text = " ".join(parts)
+            except Exception as e:
+                print(f"   ⚠️  {speaker_id}: reference transcription failed: {e}")
+            self.speaker_ref_text[speaker_id] = ref_text
+
+            # ElevenLabs Instant Voice Clone
+            try:
+                bio = BytesIO(ref_wav_bytes)
+                bio.name = f"{speaker_id}.wav"
+                voice = self.elevenlabs.voices.ivc.create(
+                    name=f"clone_{speaker_id}",
+                    files=[bio],
+                )
+                self.speaker_clone_voice_ids[speaker_id] = voice.voice_id
+                print(f"   ✅ {speaker_id}: ElevenLabs clone created ({voice.voice_id[:8]}...)")
+            except Exception as e:
+                print(f"   ⚠️  {speaker_id}: ElevenLabs cloning failed: {e}")
+
+            # Optional: build reusable local Qwen prompt for supported target languages
+            if getattr(self, "qwen_cloner", None) and self.qwen_cloner.supports_lang(self.target_lang):
+                prompt = self.qwen_cloner.create_prompt(ref_np, sample_rate, ref_text)
+                if prompt is not None:
+                    self.speaker_qwen_prompt[speaker_id] = prompt
+                    print(f"   ✅ {speaker_id}: Qwen voice-clone prompt cached")
+
+        return self.speaker_clone_voice_ids
+
     def _get_speaker_segments(
         self, audio: torch.Tensor, audio_path: str, hf_token: Optional[str]
     ) -> List[SpeakerSegment]:
@@ -666,26 +866,33 @@ class DynamicSpeakerTranslator:
                     )
                     future_to_segment[future] = (idx, seg)
                 
-                completed_segments = {}
+                completed_segments: Dict[int, TranslationSegment] = {}
+                next_to_emit = 1
+
                 for future in as_completed(future_to_segment):
                     idx, seg = future_to_segment[future]
                     try:
                         result = future.result()
-                        if result:
-                            completed_segments[idx] = result
-                            processed_count += 1
-                            
-                            elapsed = time.time() - start_time
-                            progress = (processed_count / len(segments)) * 100
-                            print(f"⚡ Completed {processed_count}/{len(segments)} ({progress:.0f}%) | {elapsed:.1f}s")
+                        if not result:
+                            continue
+
+                        completed_segments[idx] = result
+                        processed_count += 1
+
+                        elapsed = time.time() - start_time
+                        progress = (processed_count / len(segments)) * 100
+                        print(f"⚡ Completed {processed_count}/{len(segments)} ({progress:.0f}%) | {elapsed:.1f}s")
+
+                        # 🔥 STREAMING EMIT: push any contiguous ready segments in order
+                        while next_to_emit in completed_segments:
+                            ready = completed_segments.pop(next_to_emit)
+                            self.playback_queue.put(ready)
+                            with self.segments_lock:
+                                self.all_segments.append(ready)
+                            next_to_emit += 1
+
                     except Exception as e:
                         print(f"   ⚠️  Segment {idx} failed: {e}")
-                
-                for idx in sorted(completed_segments.keys()):
-                    result = completed_segments[idx]
-                    self.playback_queue.put(result)
-                    with self.segments_lock:
-                        self.all_segments.append(result)
             
             self.processing_complete.set()
             total_time = time.time() - start_time
@@ -710,8 +917,9 @@ class DynamicSpeakerTranslator:
             segments_whisper, _ = self.whisper.transcribe(
                 audio_np,
                 language=self.source_lang,
-                beam_size=1,
+                beam_size=5,
                 vad_filter=False,
+                # vad_parameters=dict(min_silence_duration_ms=250),
                 condition_on_previous_text=False
             )
             
@@ -728,33 +936,46 @@ class DynamicSpeakerTranslator:
                 translated = self.translation_model.generate(**tokens)
                 translated_text = self.tokenizer.decode(translated[0], skip_special_tokens=True)
             
-            voice_id = self.speaker_voice_ids.get(seg.speaker_id)
-            if not voice_id:
-                return None
-            
-            audio_generator = self.elevenlabs.text_to_speech.convert(
-                voice_id=voice_id,
-                text=translated_text,
-                model_id="eleven_multilingual_v2",
-                voice_settings=self.voice_settings
-            )
-            
-            audio_bytes = b"".join(audio_generator)
-            audio_segment = AudioSegment.from_mp3(io.BytesIO(audio_bytes))
-            wav_io = io.BytesIO()
-            audio_segment.export(wav_io, format="wav")
-            wav_io.seek(0)
-            
+            # Prefer Qwen voice cloning (if enabled + supported); otherwise use ElevenLabs clone.
+            wav_bytes: Optional[bytes] = None
+
+            if self.use_voice_cloning and getattr(self, "qwen_cloner", None):
+                prompt = self.speaker_qwen_prompt.get(seg.speaker_id)
+                if prompt is not None and self.qwen_cloner.supports_lang(self.target_lang):
+                    wav_bytes = self.qwen_cloner.synthesize(translated_text, self.target_lang, prompt)
+
+            if wav_bytes is None:
+                voice_id = self.speaker_voice_ids.get(seg.speaker_id)
+                if not voice_id:
+                    return None
+
+                audio_generator = self.elevenlabs.text_to_speech.convert(
+                    voice_id=voice_id,
+                    text=translated_text,
+                    model_id="eleven_multilingual_v2",
+                    voice_settings=self.voice_settings
+                )
+
+                audio_bytes = b"".join(audio_generator)
+                audio_segment = AudioSegment.from_mp3(io.BytesIO(audio_bytes))
+                wav_io = io.BytesIO()
+                audio_segment.export(wav_io, format="wav")
+                wav_io.seek(0)
+                wav_bytes = wav_io.read()
+                duration_ms = len(audio_segment)
+            else:
+                audio_segment = AudioSegment.from_wav(io.BytesIO(wav_bytes))
+                duration_ms = len(audio_segment)
+
             return TranslationSegment(
                 speaker_id=seg.speaker_id,
                 start_ms=seg.start_ms,
                 end_ms=seg.end_ms,
                 original_text=original_text,
                 translated_text=translated_text,
-                audio_bytes=wav_io.read(),
-                duration_ms=len(audio_segment)
+                audio_bytes=wav_bytes,
+                duration_ms=duration_ms
             )
-            
         except Exception as e:
             print(f"   ⚠️  Segment {idx} error: {e}")
             return None
@@ -857,7 +1078,7 @@ def main():
         target_lang=target,
         buffer_duration_sec=buffer,
         max_workers=workers,
-        use_voice_cloning=False
+        use_voice_cloning=True
     )
     
     output = translator.translate_video_streaming(video_path)
