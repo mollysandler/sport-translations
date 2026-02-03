@@ -39,3 +39,4 @@ sentencepiece>=0.2.0
 # --- TTS ---
 elevenlabs==2.32.0
 qwen-tts==0.0.5
+coqui-tts==0.27.5

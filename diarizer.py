@@ -97,7 +97,7 @@ class SpeakerDiarizer:
         segments = self._filter_short_segments(segments)
         segments = self._merge_close_segments(segments)
         segments = self._split_long_segments(segments, max_duration_sec=25.0)
-        segments = self._extend_short_segments(segments, min_duration_sec=1.0)
+        # segments = self._extend_short_segments(segments, min_duration_sec=1.0)
         
         unique_speakers = set(seg.speaker_id for seg in segments)
         print(f"✅ Diarization complete: {len(unique_speakers)} speakers, {len(segments)} segments")

@@ -430,3 +430,6 @@ temp_*.wav
 translated_*.wav
 pretrained_models
 *.mp4
+
+
+.DS_Store

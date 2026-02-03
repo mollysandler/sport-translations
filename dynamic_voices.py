@@ -14,6 +14,7 @@ import queue
 import time
 import io
 import hashlib
+import tempfile
 from scipy.io.wavfile import write as write_wav
 import torch
 from pathlib import Path
@@ -28,7 +29,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from diarizer import SpeakerDiarizer, SpeakerSegment
-
 
 @dataclass
 class TranslationSegment:
@@ -438,6 +438,67 @@ class QwenLocalVoiceCloner:
         except Exception as e:
             print(f"   ⚠️  Qwen synth failed: {e}")
             return None
+        
+
+class XTTSLocalVoiceCloner:
+    """
+    Free/local voice cloning using Coqui XTTS v2 (via `TTS` package).
+    Uses speaker reference WAV + language to synthesize speech.
+    """
+    def __init__(self, model_name: str = "tts_models/multilingual/multi-dataset/xtts_v2", device: str = "cpu"):
+        self.available = False
+        self.model_name = model_name
+        self.device = device
+        self.tts = None
+        self.output_sr = 24000
+
+        try:
+            from TTS.api import TTS  # pip install TTS
+            self.tts = TTS(model_name).to(device)
+            # Best-effort: discover model sample rate
+            try:
+                self.output_sr = int(getattr(self.tts.synthesizer, "output_sample_rate", 24000))
+            except Exception:
+                self.output_sr = 24000
+            self.available = True
+        except Exception as e:
+            print(f"   ⚠️  XTTS voice cloning unavailable: {e}")
+            self.available = False
+
+    def supports_lang(self, target_lang_iso: str) -> bool:
+        # XTTS usually supports a set of languages; fall back to allowing common ones.
+        try:
+            langs = getattr(self.tts, "languages", None)
+            if langs:
+                return target_lang_iso in langs
+        except Exception:
+            pass
+        return target_lang_iso in {"en", "es", "fr", "de", "it", "pt", "ru", "ja", "ko", "zh"}
+
+    def synthesize(self, text: str, target_lang_iso: str, ref_wav_bytes: bytes) -> Optional[bytes]:
+        if not self.available or not ref_wav_bytes:
+            return None
+
+        try:
+            # XTTS expects a path to a speaker wav
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
+                f.write(ref_wav_bytes)
+                f.flush()
+
+                # Returns a waveform (list/np array)
+                wav = self.tts.tts(
+                    text=text,
+                    speaker_wav=f.name,
+                    language=target_lang_iso
+                )
+
+            return _wav_bytes_from_audio_np(np.array(wav), int(self.output_sr))
+        except Exception as e:
+            print(f"   ⚠️  XTTS synth failed: {e}")
+            return None
+
+
+
 class DynamicSpeakerTranslator:
     """
     Translator with dynamic speaker support
@@ -463,6 +524,7 @@ class DynamicSpeakerTranslator:
         self.speaker_ref_wav: Dict[str, bytes] = {}
         self.speaker_ref_text: Dict[str, str] = {}
         self.speaker_qwen_prompt: Dict[str, object] = {}
+        self.xtts_cloner = None
         
         # Initialize services
         self._initialize_services()
@@ -547,6 +609,18 @@ class DynamicSpeakerTranslator:
                 print("   ✅ Qwen3-TTS ready (local)")
             else:
                 self.qwen_cloner = None
+
+        # 5. Optional XTTS local voice cloning (free backup clone)
+        self.xtts_cloner = None
+        if os.getenv("XTTS_ENABLE", "0") == "1":
+            print("   🧬 Loading XTTS (free local voice cloning backup)...")
+            xtts_device = os.getenv("XTTS_DEVICE", "cpu")
+            xtts_model = os.getenv("XTTS_MODEL_ID", "tts_models/multilingual/multi-dataset/xtts_v2")
+            self.xtts_cloner = XTTSLocalVoiceCloner(model_name=xtts_model, device=xtts_device)
+            if self.xtts_cloner.available:
+                print("   ✅ XTTS ready (local)")
+            else:
+                self.xtts_cloner = None
 
         print(f"✅ All services ready | Parallel workers: {self.max_workers}\n")
     
@@ -650,6 +724,12 @@ class DynamicSpeakerTranslator:
                 final_audio = self._compose_audio(self.all_segments, total_duration_sec)
                 final_audio.export(output_path, format="wav")
                 print(f"✅ Saved to: {output_path}")
+
+                # Debug artifacts: captions + verification transcripts
+                try:
+                    self._export_debug_artifacts(audio_path, output_path, video_path)
+                except Exception as e:
+                    print(f"⚠️  Debug export failed (non-fatal): {e}")
         
         return output_path
     
@@ -679,15 +759,16 @@ class DynamicSpeakerTranslator:
         segments: List[SpeakerSegment],
         sample_rate: int
     ) -> Dict[str, str]:
-        """Create one cloned voice per diarized speaker (ElevenLabs IVC), plus optional Qwen prompts.
+        """
+        Prepare per-speaker local cloning materials (Qwen prompt, XTTS ref wav),
+        and return per-speaker ElevenLabs STOCK voice_ids as absolute fallback.
 
-        Returns: {speaker_id: elevenlabs_voice_id}
+        Returns: {speaker_id: elevenlabs_stock_voice_id}
         """
         unique_speakers = sorted(set(seg.speaker_id for seg in segments))
-        print(f"\n🧬 Creating voice clones for {len(unique_speakers)} speakers...")
+        print(f"\n🧬 Preparing local voice cloning for {len(unique_speakers)} speakers...")
 
-        from io import BytesIO
-
+        # Collect reference audio per speaker (used by both Qwen and XTTS)
         for speaker_id in unique_speakers:
             speaker_segments = [s for s in segments if s.speaker_id == speaker_id]
 
@@ -707,7 +788,7 @@ class DynamicSpeakerTranslator:
                     total += seg_dur
 
             if not collected:
-                print(f"   ⚠️  {speaker_id}: insufficient audio for cloning; will fall back to default voices.")
+                print(f"   ⚠️  {speaker_id}: insufficient audio for cloning; will rely on fallback voices.")
                 continue
 
             combined = torch.cat(collected, dim=1)
@@ -719,7 +800,7 @@ class DynamicSpeakerTranslator:
             ref_wav_bytes = _wav_bytes_from_audio_np(ref_np, sample_rate)
             self.speaker_ref_wav[speaker_id] = ref_wav_bytes
 
-            # Reference transcript (helps Qwen quality; optional)
+            # Reference transcript (helps Qwen prompt quality; optional)
             ref_text = ""
             try:
                 segs, _ = self.whisper.transcribe(
@@ -729,33 +810,53 @@ class DynamicSpeakerTranslator:
                     vad_filter=False,
                     condition_on_previous_text=False
                 )
-                parts = [s.text.strip() for s in segs if s.text.strip()]
+                parts = [s.text.strip() for s in segs if s.text and s.text.strip()]
                 ref_text = " ".join(parts)
             except Exception as e:
                 print(f"   ⚠️  {speaker_id}: reference transcription failed: {e}")
             self.speaker_ref_text[speaker_id] = ref_text
 
-            # ElevenLabs Instant Voice Clone
-            try:
-                bio = BytesIO(ref_wav_bytes)
-                bio.name = f"{speaker_id}.wav"
-                voice = self.elevenlabs.voices.ivc.create(
-                    name=f"clone_{speaker_id}",
-                    files=[bio],
-                )
-                self.speaker_clone_voice_ids[speaker_id] = voice.voice_id
-                print(f"   ✅ {speaker_id}: ElevenLabs clone created ({voice.voice_id[:8]}...)")
-            except Exception as e:
-                print(f"   ⚠️  {speaker_id}: ElevenLabs cloning failed: {e}")
-
-            # Optional: build reusable local Qwen prompt for supported target languages
+            # Qwen prompt cache (primary local clone, if enabled + language supported)
             if getattr(self, "qwen_cloner", None) and self.qwen_cloner.supports_lang(self.target_lang):
                 prompt = self.qwen_cloner.create_prompt(ref_np, sample_rate, ref_text)
                 if prompt is not None:
                     self.speaker_qwen_prompt[speaker_id] = prompt
                     print(f"   ✅ {speaker_id}: Qwen voice-clone prompt cached")
 
+            # XTTS uses speaker_ref_wav bytes directly (no extra caching needed)
+            if getattr(self, "xtts_cloner", None) and self.xtts_cloner.supports_lang(self.target_lang):
+                # Just confirm availability in logs if we have ref audio
+                print(f"   ✅ {speaker_id}: XTTS ref audio ready")
+
+        # Absolute backup: assign ElevenLabs stock voices to EVERY speaker
+        fallback_map = self.voice_manager.assign_voices(audio, segments, sample_rate)
+
+        for speaker_id in unique_speakers:
+            # Ensure we always have a stock voice id for last resort
+            self.speaker_clone_voice_ids[speaker_id] = fallback_map[speaker_id]
+
+            has_qwen = speaker_id in self.speaker_qwen_prompt
+            has_xtts = (getattr(self, "xtts_cloner", None) is not None) and (speaker_id in self.speaker_ref_wav) and self.xtts_cloner.supports_lang(self.target_lang)
+
+            if has_qwen:
+                print(f"   ✅ {speaker_id}: using Qwen voice clone (backup stock voice {fallback_map[speaker_id][:8]}...)")
+            elif has_xtts:
+                print(f"   ✅ {speaker_id}: using XTTS voice clone (backup stock voice {fallback_map[speaker_id][:8]}...)")
+            else:
+                print(f"   ✅ {speaker_id}: using fallback stock voice ({fallback_map[speaker_id][:8]}...)")
+
         return self.speaker_clone_voice_ids
+
+    def _print_segments(self, label, segs):
+        print(f"\n--- {label} ({len(segs)}) ---")
+        for s in segs:
+            print(f"{s.speaker_id:10s} {s.start_ms:6d}-{s.end_ms:6d}  ({(s.end_ms-s.start_ms)}ms)")            
+            # overlap check
+        overlaps = 0
+        for a, b in zip(segs, segs[1:]):
+            if a.end_ms > b.start_ms:                    
+                overlaps += 1
+        print("overlaps:", overlaps)
 
     def _get_speaker_segments(
         self, audio: torch.Tensor, audio_path: str, hf_token: Optional[str]
@@ -767,15 +868,20 @@ class DynamicSpeakerTranslator:
         if hf_token is None:
             hf_token = os.getenv("HUGGING_FACE_TOKEN")
         
-        temp_path = "temp_full_audio.wav"
-        torchaudio.save(temp_path, audio, self.sample_rate)
-        
         diarizer = SpeakerDiarizer(hf_token)
         raw_segments = diarizer.diarize(audio, self.sample_rate)
-        os.remove(temp_path)
-        
-        # Remove overlapping segments
-        segments = self._remove_overlaps(raw_segments)
+
+        segments = self._make_exclusive_turns(
+            raw_segments,
+            solo_keep_ms=250,
+            ignore_interruptions_ms=900,
+            min_turn_ms=350,
+            merge_gap_ms=120,
+        )
+
+        # call it:
+        self._print_segments("RAW", raw_segments)
+        self._print_segments("EXCLUSIVE", segments)
         
         speaker_counts = {}
         for seg in segments:
@@ -787,93 +893,132 @@ class DynamicSpeakerTranslator:
         
         return segments
     
-    def _remove_overlaps(self, segments: List[SpeakerSegment]) -> List[SpeakerSegment]:
+    def _make_exclusive_turns(
+    self,
+    segments: List[SpeakerSegment],
+    solo_keep_ms: int = 250,         
+    ignore_interruptions_ms: int = 900,
+    min_turn_ms: int = 350,
+    merge_gap_ms: int = 120,
+) -> List[SpeakerSegment]:
         """
-        Smart overlap handling:
-        - Remove true duplicates (same speaker, heavy overlap)
-        - Trim minor overlaps (different speakers, slight overlap)
-        - Preserve all unique dialogue
+        Convert overlap-capable diarization into exclusive turns.
+
+        Key policy for sports:
+        - An "interruption" is only kept as a real turn if it has >= solo_keep_ms of SOLO speech.
+        - Overlap-only spurts (never solo) are treated as crosstalk and usually absorbed.
         """
         if not segments:
-            return segments
-        
-        # Sort by start time
-        sorted_segs = sorted(segments, key=lambda s: s.start_sec)
-        
-        cleaned = []
-        i = 0
-        
-        while i < len(sorted_segs):
-            current = sorted_segs[i]
-            
-            # Look ahead for overlaps
-            if i + 1 < len(sorted_segs):
-                next_seg = sorted_segs[i + 1]
-                
-                # Check for overlap
-                if current.end_sec > next_seg.start_sec:
-                    overlap = current.end_sec - next_seg.start_sec
-                    curr_duration = current.end_sec - current.start_sec
-                    next_duration = next_seg.end_sec - next_seg.start_sec
-                    
-                    # Case 1: Same speaker with heavy overlap (>70%) = DUPLICATE
-                    if current.speaker_id == next_seg.speaker_id:
-                        overlap_pct = overlap / min(curr_duration, next_duration)
-                        if overlap_pct > 0.7:
-                            # Keep longer segment, skip shorter
-                            if next_duration > curr_duration:
-                                current = next_seg
-                            i += 1  # Skip next segment
-                            continue
-                    
-                    # Case 2: Light overlap (<30%) = TRIM
-                    overlap_pct = overlap / max(curr_duration, next_duration)
-                    if overlap_pct < 0.3:
-                        # Trim at 75% point of overlap (favor keeping more of each)
-                        split_point = current.end_sec - (overlap * 0.25)
-                        
-                        current = SpeakerSegment(
-                            speaker_id=current.speaker_id,
-                            start_ms=current.start_ms,
-                            end_ms=int(split_point * 1000),
-                            start_sec=current.start_sec,
-                            end_sec=split_point
-                        )
-                        
-                        # Don't modify next_seg here, it will be processed in next iteration
-            
-            cleaned.append(current)
-            i += 1
-        
-        removed = len(segments) - len(cleaned)
-        if removed > 0:
-            print(f"   🔧 Removed {removed} duplicate segments")
-        
-        return cleaned
+            return []
+
+        segs = sorted(segments, key=lambda s: (s.start_ms, s.end_ms, s.speaker_id))
+
+        time_to_starts = {}
+        time_to_ends = {}
+        for seg in segs:
+            time_to_starts.setdefault(seg.start_ms, []).append((seg.speaker_id, seg.start_ms))
+            time_to_ends.setdefault(seg.end_ms, []).append(seg.speaker_id)
+
+        times = sorted(set(time_to_starts.keys()) | set(time_to_ends.keys()))
+        if len(times) < 2:
+            return []
+
+        active = {}  # speaker_id -> start_ms
+        intervals = []  # (speaker_id, start, end, is_solo)
+
+        for i, t in enumerate(times[:-1]):
+            # end first (half-open [start, end))
+            for spk in time_to_ends.get(t, []):
+                active.pop(spk, None)
+
+            for spk, start_ms in time_to_starts.get(t, []):
+                active[spk] = start_ms
+
+            t_next = times[i + 1]
+            if t_next <= t or not active:
+                continue
+
+            chosen = max(active.items(), key=lambda kv: kv[1])[0]  # interrupter wins
+            is_solo = (len(active) == 1)
+            intervals.append((chosen, t, t_next, is_solo))
+
+        if not intervals:
+            return []
+
+        # Merge adjacent intervals with same speaker, accumulating solo duration
+        merged = []
+        spk, s, e, is_solo = intervals[0]
+        solo = (e - s) if is_solo else 0
+        merged.append([spk, s, e, solo])  # [spk, start, end, solo_ms]
+
+        for spk, s, e, is_solo in intervals[1:]:
+            p_spk, p_s, p_e, p_solo = merged[-1]
+            add_solo = (e - s) if is_solo else 0
+
+            if spk == p_spk and s <= p_e + merge_gap_ms:
+                merged[-1] = [p_spk, p_s, max(p_e, e), p_solo + add_solo]
+            else:
+                merged.append([spk, s, e, add_solo])
+
+        # Debounce: absorb overlap-only (or near overlap-only) interruptions
+        debounced = []
+        for spk, s, e, solo_ms in merged:
+            dur = e - s
+
+            # If this segment does NOT have enough SOLO floor time,
+            # treat it as crosstalk unless it's truly long.
+            should_absorb = (solo_ms < solo_keep_ms) and (dur < ignore_interruptions_ms)
+
+            if debounced and should_absorb:
+                p_spk, p_s, p_e, p_solo = debounced[-1]
+                debounced[-1] = [p_spk, p_s, e, p_solo]  # extend previous speaker
+            else:
+                debounced.append([spk, s, e, solo_ms])
+
+        # Merge again after debouncing (gaps)
+        merged2 = [debounced[0]]
+        for spk, s, e, solo_ms in debounced[1:]:
+            p_spk, p_s, p_e, p_solo = merged2[-1]
+            if spk == p_spk and s <= p_e + merge_gap_ms:
+                merged2[-1] = [p_spk, p_s, max(p_e, e), p_solo + solo_ms]
+            else:
+                merged2.append([spk, s, e, solo_ms])
+
+        # Filter tiny turns
+        out = []
+        for spk, s, e, _solo_ms in merged2:
+            if (e - s) < min_turn_ms:
+                continue
+            out.append(SpeakerSegment(spk, s, e, s / 1000.0, e / 1000.0))
+
+        out.sort(key=lambda x: x.start_ms)
+        return out
     
     def _process_segments_parallel(self, audio: torch.Tensor, segments: List[SpeakerSegment]):
-        """Process segments in parallel"""
+        """Process segments in parallel (skip-safe ordered emission)."""
         try:
             start_time = time.time()
             processed_count = 0
-            
+
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 future_to_segment = {}
                 for idx, seg in enumerate(segments, 1):
-                    future = executor.submit(
-                        self._process_single_segment,
-                        audio, seg, idx, len(segments)
-                    )
+                    future = executor.submit(self._process_single_segment, idx, seg, audio)
                     future_to_segment[future] = (idx, seg)
-                
+
                 completed_segments: Dict[int, TranslationSegment] = {}
+                skipped = set()
                 next_to_emit = 1
 
                 for future in as_completed(future_to_segment):
-                    idx, seg = future_to_segment[future]
+                    idx, _seg = future_to_segment[future]
                     try:
                         result = future.result()
+
                         if not result:
+                            skipped.add(idx)
+                            while next_to_emit in skipped:
+                                next_to_emit += 1
                             continue
 
                         completed_segments[idx] = result
@@ -883,89 +1028,272 @@ class DynamicSpeakerTranslator:
                         progress = (processed_count / len(segments)) * 100
                         print(f"⚡ Completed {processed_count}/{len(segments)} ({progress:.0f}%) | {elapsed:.1f}s")
 
-                        # 🔥 STREAMING EMIT: push any contiguous ready segments in order
-                        while next_to_emit in completed_segments:
-                            ready = completed_segments.pop(next_to_emit)
-                            self.playback_queue.put(ready)
-                            with self.segments_lock:
-                                self.all_segments.append(ready)
-                            next_to_emit += 1
+                        # Emit contiguous ready segments in order, skipping failures
+                        while True:
+                            if next_to_emit in skipped:
+                                next_to_emit += 1
+                                continue
+                            if next_to_emit in completed_segments:
+                                ready = completed_segments.pop(next_to_emit)
+                                self.playback_queue.put(ready)
+                                with self.segments_lock:
+                                    self.all_segments.append(ready)
+                                next_to_emit += 1
+                                continue
+                            break
 
                     except Exception as e:
                         print(f"   ⚠️  Segment {idx} failed: {e}")
-            
+                        skipped.add(idx)
+                        while next_to_emit in skipped:
+                            next_to_emit += 1
+
             self.processing_complete.set()
             total_time = time.time() - start_time
-            speedup = (audio.shape[1] / self.sample_rate) / total_time
+            speedup = (audio.shape[1] / self.sample_rate) / total_time if total_time > 0 else 0.0
             print(f"\n✅ Processing complete! {total_time:.1f}s ({speedup:.2f}x real-time)")
-            
+
         except Exception as e:
             self.error_message = str(e)
             self.error_occurred.set()
             print(f"\n❌ Error: {e}")
-    
+
+    def _tts_bytes_to_wav(self, audio_bytes: bytes, output_sr: int = 24000) -> tuple[bytes, int]:
+        """
+        Convert arbitrary TTS bytes (often MP3 from ElevenLabs) into normalized WAV bytes.
+        Returns (wav_bytes, duration_ms).
+        """
+        if not audio_bytes:
+            raise ValueError("TTS returned empty audio bytes")
+
+        bio = io.BytesIO(audio_bytes)
+
+        audio_segment = None
+        # ElevenLabs commonly returns MP3. Try MP3 first, then fall back.
+        for fmt in ("mp3", "wav", "m4a", "ogg"):
+            try:
+                bio.seek(0)
+                audio_segment = AudioSegment.from_file(bio, format=fmt)
+                break
+            except Exception:
+                continue
+
+        if audio_segment is None:
+            # Last resort: let ffmpeg auto-detect (can work if bytes have headers)
+            bio.seek(0)
+            audio_segment = AudioSegment.from_file(bio)
+
+        audio_segment = audio_segment.set_frame_rate(output_sr).set_channels(1)
+        duration_ms = len(audio_segment)
+
+        wav_io = io.BytesIO()
+        audio_segment.export(wav_io, format="wav")
+        wav_bytes = wav_io.getvalue()
+
+        # Validate WAV header
+        if not wav_bytes.startswith(b"RIFF") or b"WAVE" not in wav_bytes[:32]:
+            raise ValueError(f"Invalid WAV header; first 16 bytes: {wav_bytes[:16]!r}")
+
+        return wav_bytes, duration_ms
+
     def _process_single_segment(
-        self, audio: torch.Tensor, seg: SpeakerSegment, idx: int, total: int
+        self,
+        idx: int,
+        seg: SpeakerSegment,
+        audio: torch.Tensor,
     ) -> Optional[TranslationSegment]:
-        """Process one segment"""
+        """
+        Process one diarized segment: ASR -> translate -> TTS -> TranslationSegment.
+
+        Safe behaviors:
+        - XTTS: chunk long text to avoid truncation (common ~239 char limit warning)
+        - Concatenate chunk WAVs cleanly
+        - Falls back to ElevenLabs stock voice if Qwen/XTTS fails
+        """
         try:
+            # ----------------------------
+            # 1) Slice waveform for ASR
+            # ----------------------------
             start_sample = int(seg.start_sec * self.sample_rate)
             end_sample = int(seg.end_sec * self.sample_rate)
+            if end_sample <= start_sample:
+                return None
+
             segment_audio = audio[:, start_sample:end_sample]
-            
             audio_np = segment_audio.squeeze().numpy()
+
+            # ----------------------------
+            # 2) ASR (Faster-Whisper)
+            # ----------------------------
             segments_whisper, _ = self.whisper.transcribe(
                 audio_np,
                 language=self.source_lang,
                 beam_size=5,
                 vad_filter=False,
-                # vad_parameters=dict(min_silence_duration_ms=250),
-                condition_on_previous_text=False
+                condition_on_previous_text=False,
             )
-            
-            text_parts = [s.text.strip() for s in segments_whisper if s.text.strip()]
+
+            text_parts = [s.text.strip() for s in segments_whisper if s.text and s.text.strip()]
             if not text_parts:
+                print(f"   ⚠️  No ASR text for {seg.speaker_id} (segment {idx}, {seg.end_ms - seg.start_ms}ms) — skipping")
                 return None
-            
+
             original_text = " ".join(text_parts)
-            
+
+            # ----------------------------
+            # 3) Translate
+            # ----------------------------
             if not self.use_local_translation:
                 translated_text = self.translator.translate(original_text)
             else:
                 tokens = self.tokenizer([original_text], return_tensors="pt", padding=True)
                 translated = self.translation_model.generate(**tokens)
                 translated_text = self.tokenizer.decode(translated[0], skip_special_tokens=True)
-            
-            # Prefer Qwen voice cloning (if enabled + supported); otherwise use ElevenLabs clone.
-            wav_bytes: Optional[bytes] = None
 
+            # ----------------------------
+            # Helpers: chunking + wav concat
+            # ----------------------------
+            def _chunk_text_for_tts(text: str, max_chars: int) -> List[str]:
+                """
+                Chunk text to <= max_chars, preferring to split at punctuation/space.
+                Keeps it simple and robust.
+                """
+                text = " ".join(text.split())
+                if len(text) <= max_chars:
+                    return [text]
+
+                chunks: List[str] = []
+                s = text
+                preferred_breaks = [". ", "! ", "? ", "; ", ": ", ", ", " — ", " - "]
+
+                while len(s) > max_chars:
+                    window = s[: max_chars + 1]
+
+                    cut = -1
+                    # Try preferred punctuation boundaries first
+                    for br in preferred_breaks:
+                        pos = window.rfind(br)
+                        if pos != -1 and pos >= int(max_chars * 0.55):
+                            cut = pos + len(br)
+                            break
+
+                    # Fallback: last space
+                    if cut == -1:
+                        pos = window.rfind(" ")
+                        if pos != -1 and pos >= int(max_chars * 0.55):
+                            cut = pos + 1
+
+                    # Hard fallback: forced cut
+                    if cut == -1:
+                        cut = max_chars
+
+                    chunk = s[:cut].strip()
+                    if chunk:
+                        chunks.append(chunk)
+                    s = s[cut:].strip()
+
+                if s:
+                    chunks.append(s)
+
+                return chunks
+
+            def _concat_wav_bytes(wav_list: List[bytes], silence_ms: int = 50) -> bytes:
+                """
+                Concatenate multiple WAV byte blobs into one WAV (24kHz mono),
+                inserting short silence between chunks.
+                """
+                if not wav_list:
+                    raise ValueError("No wav chunks to concatenate")
+
+                out = AudioSegment.silent(duration=0, frame_rate=24000)
+                gap = AudioSegment.silent(duration=int(silence_ms), frame_rate=24000)
+
+                for i, wb in enumerate(wav_list):
+                    seg_audio = AudioSegment.from_wav(io.BytesIO(wb))
+                    seg_audio = seg_audio.set_frame_rate(24000).set_channels(1)
+                    # tiny fades to prevent clicks
+                    seg_audio = seg_audio.fade_in(10).fade_out(10)
+                    if i > 0 and silence_ms > 0:
+                        out += gap
+                    out += seg_audio
+
+                bio = io.BytesIO()
+                out.export(bio, format="wav")
+                return bio.getvalue()
+
+            # You can tune these via env vars:
+            # - XTTS_MAX_CHARS (default 220)
+            # - XTTS_CHUNK_SILENCE_MS (default 50)
+            lang_default_limits = {
+                "es": 220,
+                "en": 260,
+                "fr": 220,
+                "de": 220,
+                "it": 220,
+                "pt": 220,
+            }
+            xtts_max_chars = int(os.getenv("XTTS_MAX_CHARS", str(lang_default_limits.get(self.target_lang, 220))))
+            xtts_silence_ms = int(os.getenv("XTTS_CHUNK_SILENCE_MS", "50"))
+
+            # ----------------------------
+            # 4) TTS (Qwen -> XTTS -> Eleven)
+            # ----------------------------
+            wav_bytes: Optional[bytes] = None
+            duration_ms: Optional[int] = None
+
+            # 4A) Primary: Qwen local clone (if enabled + prompt exists)
             if self.use_voice_cloning and getattr(self, "qwen_cloner", None):
                 prompt = self.speaker_qwen_prompt.get(seg.speaker_id)
                 if prompt is not None and self.qwen_cloner.supports_lang(self.target_lang):
-                    wav_bytes = self.qwen_cloner.synthesize(translated_text, self.target_lang, prompt)
+                    try:
+                        qwen_bytes = self.qwen_cloner.synthesize(translated_text, self.target_lang, prompt)
+                        if qwen_bytes:
+                            wav_bytes, duration_ms = self._tts_bytes_to_wav(qwen_bytes, output_sr=24000)
+                    except Exception as e:
+                        print(f"   ⚠️  Qwen TTS failed for {seg.speaker_id} (segment {idx}): {e}")
 
+            # 4B) Backup: XTTS local clone (if enabled + ref wav exists)
+            if wav_bytes is None and self.use_voice_cloning and getattr(self, "xtts_cloner", None):
+                ref_wav = self.speaker_ref_wav.get(seg.speaker_id)
+                if ref_wav and self.xtts_cloner.supports_lang(self.target_lang):
+                    try:
+                        # Chunk long text to avoid truncation warnings/bugs
+                        chunks = _chunk_text_for_tts(translated_text, xtts_max_chars)
+                        xtts_wavs: List[bytes] = []
+
+                        for c in chunks:
+                            xtts_bytes = self.xtts_cloner.synthesize(c, self.target_lang, ref_wav)
+                            if not xtts_bytes:
+                                raise ValueError("XTTS returned empty bytes")
+                            w, _dur = self._tts_bytes_to_wav(xtts_bytes, output_sr=24000)
+                            xtts_wavs.append(w)
+
+                        # Concatenate chunk audio
+                        wav_bytes = _concat_wav_bytes(xtts_wavs, silence_ms=xtts_silence_ms)
+                        wav_bytes, duration_ms = self._tts_bytes_to_wav(wav_bytes, output_sr=24000)
+
+                    except Exception as e:
+                        print(f"   ⚠️  XTTS failed for {seg.speaker_id} (segment {idx}): {e}")
+                        wav_bytes = None
+                        duration_ms = None
+
+            # 4C) Absolute last resort: ElevenLabs stock voice
             if wav_bytes is None:
                 voice_id = self.speaker_voice_ids.get(seg.speaker_id)
                 if not voice_id:
+                    print(f"   ⚠️  No voice_id for {seg.speaker_id} (segment {idx}) — skipping")
                     return None
 
                 audio_generator = self.elevenlabs.text_to_speech.convert(
                     voice_id=voice_id,
                     text=translated_text,
                     model_id="eleven_multilingual_v2",
-                    voice_settings=self.voice_settings
+                    voice_settings=self.voice_settings,
                 )
+                eleven_bytes = b"".join(audio_generator)
+                wav_bytes, duration_ms = self._tts_bytes_to_wav(eleven_bytes, output_sr=24000)
 
-                audio_bytes = b"".join(audio_generator)
-                audio_segment = AudioSegment.from_mp3(io.BytesIO(audio_bytes))
-                wav_io = io.BytesIO()
-                audio_segment.export(wav_io, format="wav")
-                wav_io.seek(0)
-                wav_bytes = wav_io.read()
-                duration_ms = len(audio_segment)
-            else:
-                audio_segment = AudioSegment.from_wav(io.BytesIO(wav_bytes))
-                duration_ms = len(audio_segment)
+            assert wav_bytes is not None and duration_ms is not None
 
             return TranslationSegment(
                 speaker_id=seg.speaker_id,
@@ -974,89 +1302,283 @@ class DynamicSpeakerTranslator:
                 original_text=original_text,
                 translated_text=translated_text,
                 audio_bytes=wav_bytes,
-                duration_ms=duration_ms
+                duration_ms=duration_ms,
             )
+
         except Exception as e:
             print(f"   ⚠️  Segment {idx} error: {e}")
             return None
-    
+
     def _playback_thread(self, buffer_count: int):
-        """Playback thread"""
+        """Playback thread (matches concat + clipped-gaps compose policy)."""
         try:
             print(f"⏳ Waiting for buffer ({buffer_count} segments)...")
-            
+
             while self.playback_queue.qsize() < buffer_count:
                 time.sleep(0.3)
                 if self.error_occurred.is_set():
                     return
                 if self.processing_complete.is_set() and self.playback_queue.qsize() > 0:
                     break
-            
+
             print(f"\n📊 BUFFER READY! Starting playback...\n")
-            print("="*70)
-            
+            print("=" * 70)
+
             count = 0
-            prev_end = 0
-            
+            prev_orig_end: Optional[int] = None
+            MAX_PAUSE_MS = 500
+
             while not self.processing_complete.is_set() or not self.playback_queue.empty():
                 try:
                     segment = self.playback_queue.get(timeout=2)
                     count += 1
-                    
+
                     audio_seg = AudioSegment.from_wav(io.BytesIO(segment.audio_bytes))
-                    
-                    gap = segment.start_ms - prev_end
-                    if gap > 100:
-                        play(AudioSegment.silent(duration=int(gap)))
-                    
+                    audio_seg = audio_seg.set_frame_rate(24000).set_channels(1)
+
+                    # Remove leading silence by anchoring to first segment's start_ms
+                    if prev_orig_end is None:
+                        prev_orig_end = segment.start_ms
+
+                    orig_gap = segment.start_ms - prev_orig_end
+                    pause_ms = max(0, min(orig_gap, MAX_PAUSE_MS))
+                    if pause_ms > 0:
+                        play(AudioSegment.silent(duration=int(pause_ms), frame_rate=24000))
+
                     print(f"📊 [{segment.speaker_id}] {segment.translated_text[:60]}...")
                     play(audio_seg)
-                    
-                    prev_end = segment.start_ms + segment.duration_ms
+
+                    prev_orig_end = segment.end_ms
                     self.playback_queue.task_done()
-                    
+
                 except queue.Empty:
                     if not self.processing_complete.is_set():
                         time.sleep(0.3)
                     else:
                         break
-            
+
             print(f"\n✅ Playback complete! {count} segments")
-            
+
         except Exception as e:
             self.error_message = str(e)
             self.error_occurred.set()
             print(f"\n❌ Playback error: {e}")
+
     
     def _compose_audio(self, segments, total_duration_sec):
-        """Compose final audio"""
-        canvas_ms = int(total_duration_sec * 1000) + 5000
-        final_audio = AudioSegment.silent(duration=canvas_ms)
-        
-        prev_orig_end = 0
-        prev_trans_end = 0
-        
+        OUTPUT_SR = 24000
+        MAX_PAUSE_MS = 500  # tune 300–800
+
+        if not segments:
+            return AudioSegment.silent(duration=0, frame_rate=OUTPUT_SR)
+
+        final_audio = AudioSegment.silent(duration=0, frame_rate=OUTPUT_SR)
+        prev_orig_end = segments[0].start_ms  # removes leading silence
+
         for seg in segments:
             seg_audio = AudioSegment.from_wav(io.BytesIO(seg.audio_bytes))
-            
+            seg_audio = seg_audio.set_frame_rate(OUTPUT_SR).set_channels(1)
+
             orig_gap = seg.start_ms - prev_orig_end
-            
-            if orig_gap < 200:
-                actual_start = prev_trans_end + 100
-            else:
-                ideal_start = prev_trans_end + orig_gap
-                actual_start = max(seg.start_ms, ideal_start)
-            
-            required = actual_start + seg.duration_ms
-            if len(final_audio) < required:
-                final_audio += AudioSegment.silent(duration=required - len(final_audio) + 2000)
-            
-            final_audio = final_audio.overlay(seg_audio, position=actual_start)
-            
+            pause_ms = max(0, orig_gap)
+            pause_ms = min(pause_ms, MAX_PAUSE_MS)
+
+            if pause_ms:
+                final_audio += AudioSegment.silent(duration=pause_ms, frame_rate=OUTPUT_SR)
+
+            final_audio += seg_audio
             prev_orig_end = seg.end_ms
-            prev_trans_end = actual_start + seg.duration_ms
-        
+
         return final_audio
+
+    def _ms_to_srt_ts(self, ms: int) -> str:
+        ms = max(0, int(ms))
+        h = ms // 3600000
+        ms -= h * 3600000
+        m = ms // 60000
+        ms -= m * 60000
+        s = ms // 1000
+        ms -= s * 1000
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    def _ms_to_vtt_ts(self, ms: int) -> str:
+        ms = max(0, int(ms))
+        h = ms // 3600000
+        ms -= h * 3600000
+        m = ms // 60000
+        ms -= m * 60000
+        s = ms // 1000
+        ms -= s * 1000
+        return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+    def _write_srt(self, items, path: str):
+        # items: list[(start_ms, end_ms, text)]
+        lines = []
+        for i, (s, e, text) in enumerate(items, 1):
+            lines.append(str(i))
+            lines.append(f"{self._ms_to_srt_ts(s)} --> {self._ms_to_srt_ts(e)}")
+            lines.append(text.strip())
+            lines.append("")
+        Path(path).write_text("\n".join(lines), encoding="utf-8")
+
+    def _write_vtt(self, items, path: str):
+        # items: list[(start_ms, end_ms, text)]
+        lines = ["WEBVTT", ""]
+        for (s, e, text) in items:
+            lines.append(f"{self._ms_to_vtt_ts(s)} --> {self._ms_to_vtt_ts(e)}")
+            lines.append(text.strip())
+            lines.append("")
+        Path(path).write_text("\n".join(lines), encoding="utf-8")
+
+    def _build_output_timeline_captions(self, segments: List["TranslationSegment"]) -> List[tuple]:
+        """
+        Build captions aligned to the OUTPUT audio timeline.
+        Must match the pause-capping logic in _compose_audio.
+        Returns list of (out_start_ms, out_end_ms, caption_text).
+        """
+        OUTPUT_SR = 24000
+        MAX_PAUSE_MS = 500  # MUST MATCH _compose_audio
+
+        if not segments:
+            return []
+
+        segs = sorted(segments, key=lambda x: x.start_ms)
+
+        out_items = []
+        out_cursor = 0
+        prev_orig_end = segs[0].start_ms  # removes leading silence (matches _compose_audio)
+
+        for seg in segs:
+            orig_gap = seg.start_ms - prev_orig_end
+            pause_ms = max(0, orig_gap)
+            pause_ms = min(pause_ms, MAX_PAUSE_MS)
+
+            out_cursor += pause_ms
+            out_start = out_cursor
+            out_end = out_start + int(seg.duration_ms)
+
+            # Include speaker label so you can visually confirm switching
+            caption_text = f"[{seg.speaker_id}] {seg.translated_text}"
+
+            out_items.append((out_start, out_end, caption_text))
+
+            out_cursor = out_end
+            prev_orig_end = seg.end_ms
+
+        return out_items
+
+    def _transcribe_full_audio_to_srt_and_txt(self, wav_path: str, language: str, out_prefix: str):
+        """
+        Full-file ASR transcript with timestamps -> SRT + TXT.
+        Uses your existing whisper instance (small.en if src=en). Works best for source audio.
+        """
+        from faster_whisper import WhisperModel
+
+        # Use a multilingual model if language isn't English.
+        # This runs only in debug mode; it can be slow.
+        model_name = "small.en" if language == "en" else "small"
+        dbg_whisper = WhisperModel(model_name, device="cpu", compute_type="int8", num_workers=2)
+
+        segs, _ = dbg_whisper.transcribe(
+            wav_path,
+            language=language,
+            beam_size=5,
+            vad_filter=True,
+            condition_on_previous_text=False,
+        )
+
+        items = []
+        full = []
+        for s in segs:
+            txt = (s.text or "").strip()
+            if not txt:
+                continue
+            start_ms = int(s.start * 1000)
+            end_ms = int(s.end * 1000)
+            items.append((start_ms, end_ms, txt))
+            full.append(txt)
+
+        self._write_srt(items, f"{out_prefix}.srt")
+        Path(f"{out_prefix}.txt").write_text(" ".join(full), encoding="utf-8")
+
+    def _transcribe_output_audio_for_validation(self, wav_path: str, language: str, out_txt_path: str) -> str:
+        """
+        ASR the OUTPUT WAV so we can verify what was actually spoken.
+        Returns recognized text.
+        """
+        from faster_whisper import WhisperModel
+
+        dbg_whisper = WhisperModel("small", device="cpu", compute_type="int8", num_workers=2)
+        segs, _ = dbg_whisper.transcribe(
+            wav_path,
+            language=language,
+            beam_size=5,
+            vad_filter=True,
+            condition_on_previous_text=False,
+        )
+
+        parts = []
+        for s in segs:
+            txt = (s.text or "").strip()
+            if txt:
+                parts.append(txt)
+
+        recognized = " ".join(parts)
+        Path(out_txt_path).write_text(recognized, encoding="utf-8")
+        return recognized
+
+    def _simple_similarity(self, a: str, b: str) -> float:
+        """
+        Cheap similarity: token overlap F1-ish.
+        Not perfect, but great for catching obvious missing speech.
+        """
+        import re
+        ta = re.findall(r"\w+", (a or "").lower())
+        tb = re.findall(r"\w+", (b or "").lower())
+        if not ta or not tb:
+            return 0.0
+        sa, sb = set(ta), set(tb)
+        inter = len(sa & sb)
+        prec = inter / max(1, len(sa))
+        rec = inter / max(1, len(sb))
+        if (prec + rec) == 0:
+            return 0.0
+        return 2 * prec * rec / (prec + rec)
+
+    def _export_debug_artifacts(self, original_audio_wav: str, output_wav: str, video_path: str):
+        """
+        Writes:
+        - Output captions aligned to output audio timeline: .srt + .vtt
+        - Full source transcript (independent of diarization): .srt + .txt
+        - Output ASR transcript + similarity score (to see if TTS spoke everything)
+        """
+        stem = Path(video_path).stem
+
+        # 1) Output captions aligned to OUTPUT audio timeline
+        with self.segments_lock:
+            segs = list(self.all_segments)
+        out_caps = self._build_output_timeline_captions(segs)
+        out_srt = f"translated_{stem}_{self.target_lang}.srt"
+        out_vtt = f"translated_{stem}_{self.target_lang}.vtt"
+        self._write_srt(out_caps, out_srt)
+        self._write_vtt(out_caps, out_vtt)
+        print(f"✅ Wrote output captions: {out_srt}, {out_vtt}")
+
+        # 2) Full transcript of ORIGINAL audio (independent check)
+        # Enable with env so you can turn it off when latency matters.
+        if os.getenv("EXPORT_SOURCE_TRANSCRIPT", "1") == "1":
+            src_prefix = f"source_{stem}_{self.source_lang}"
+            self._transcribe_full_audio_to_srt_and_txt(original_audio_wav, self.source_lang, src_prefix)
+            print(f"✅ Wrote source transcript: {src_prefix}.srt, {src_prefix}.txt")
+
+        # 3) ASR the OUTPUT audio and compare to intended translated_text
+        if os.getenv("VALIDATE_OUTPUT_ASR", "1") == "1":
+            expected = " ".join([s.translated_text for s in segs if s.translated_text])
+            out_asr_path = f"output_asr_{stem}_{self.target_lang}.txt"
+            recognized = self._transcribe_output_audio_for_validation(output_wav, self.target_lang, out_asr_path)
+            sim = self._simple_similarity(expected, recognized)
+            print(f"✅ Wrote output ASR transcript: {out_asr_path}")
+            print(f"🔎 Output spoken-vs-expected similarity: {sim:.2f} (lower usually means missing speech or ASR errors)")
 
 
 def main():
