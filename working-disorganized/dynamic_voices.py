@@ -12,8 +12,8 @@ import sys
 import threading
 import queue
 import time
+import librosa
 import io
-import hashlib
 import tempfile
 from scipy.io.wavfile import write as write_wav
 import torch
@@ -40,6 +40,26 @@ class TranslationSegment:
     audio_bytes: bytes
     duration_ms: int
 
+def estimate_pitch_yin(y, sr):
+    y = y.astype(np.float32)
+    f0 = librosa.yin(y, fmin=70, fmax=300, sr=sr)  # speech range
+    # yin returns an f0 for every frame; filter nonsense
+    f0 = f0[np.isfinite(f0)]
+    if len(f0) == 0:
+        return None
+    return float(np.median(f0))  # median is robust
+
+def gender_from_pitch(p, pitch_range=None):
+    if p is None:
+        return "unknown"
+    if pitch_range is not None and pitch_range > 35:
+        return "unknown"  # unstable f0
+    if p < 160:
+        return "male"
+    if p > 180:
+        return "female"
+    return "unknown"
+
 
 @dataclass
 class VoiceProfile:
@@ -50,7 +70,6 @@ class VoiceProfile:
     pitch_range: float  # Variation in pitch
     speaking_rate: float  # Words per second estimate
     voice_id: str  # Assigned ElevenLabs voice ID
-
 
 class SmartVoiceManager:
     """
@@ -137,63 +156,35 @@ class SmartVoiceManager:
     ) -> VoiceProfile:
         """
         Analyze speaker's voice characteristics to match appropriate voice
-        """
-        audio_np = audio_sample.squeeze().numpy()
-        
-        # 1. Estimate fundamental frequency (pitch)
+        """        
+        audio_np = audio_sample.squeeze().detach().cpu().numpy().astype(np.float32)
+
+        # Optional: light high-pass to reduce rumble that confuses F0
         try:
-            import librosa
-            # Extract pitch using librosa
-            pitches, magnitudes = librosa.piptrack(
-                y=audio_np, 
-                sr=sample_rate,
-                fmin=50,  # Male voices can go down to ~80Hz
-                fmax=400  # Female voices typically up to ~350Hz
-            )
-            
-            # Get average pitch (filter out zeros)
-            pitch_values = []
-            for t in range(pitches.shape[1]):
-                index = magnitudes[:, t].argmax()
-                pitch = pitches[index, t]
-                if pitch > 0:
-                    pitch_values.append(pitch)
-            
-            if pitch_values:
-                avg_pitch = np.mean(pitch_values)
-                pitch_range = np.std(pitch_values)
-            else:
-                # Fallback if pitch detection fails
-                avg_pitch = 150  # Neutral default
-                pitch_range = 20
-                
-        except ImportError:
-            # If librosa not installed, use simple heuristics
-            print(f"   ⚠️  librosa not installed, using basic voice detection")
-            # Use energy in different frequency bands as proxy
-            from scipy import signal
-            
-            # Simple frequency analysis
-            freqs, psd = signal.welch(audio_np, sample_rate)
-            
-            # Energy in low (male) vs high (female) frequencies
-            low_energy = np.sum(psd[(freqs > 80) & (freqs < 180)])
-            high_energy = np.sum(psd[(freqs > 180) & (freqs < 300)])
-            
-            if low_energy > high_energy * 1.5:
-                avg_pitch = 120  # Likely male
-            else:
-                avg_pitch = 220  # Likely female
-            pitch_range = 20
-        
-        # 2. Determine gender based on pitch
-        if avg_pitch < 160:
-            gender = "male"
+            audio_np = librosa.effects.preemphasis(audio_np)
+        except Exception:
+            pass
+
+        # 1) Pitch estimate (choose ONE)
+        # Fast:
+        avg_pitch = estimate_pitch_yin(audio_np, sample_rate)
+
+        # Or more stable (slower): pYIN
+        # avg_pitch = estimate_pitch_pyin(audio_np, sample_rate)
+
+        if avg_pitch is None:
+            avg_pitch = 150.0
+            pitch_range = 20.0
         else:
-            gender = "female"
+            # compute a pitch range robustly too
+            f0 = librosa.yin(audio_np, fmin=70, fmax=300, sr=sample_rate)
+            f0 = f0[np.isfinite(f0)]
+            pitch_range = float(np.std(f0)) if len(f0) else 20.0
+
+        # 2) Gender (use your helper with an “unknown” band)
+        gender = gender_from_pitch(avg_pitch, pitch_range)
         
         # 3. Estimate speaking rate (simple)
-        duration_sec = len(audio_np) / sample_rate
         # Rough estimate: detect speech segments
         energy = np.abs(audio_np)
         speech_ratio = np.sum(energy > 0.01) / len(energy)
@@ -724,12 +715,6 @@ class DynamicSpeakerTranslator:
                 final_audio = self._compose_audio(self.all_segments, total_duration_sec)
                 final_audio.export(output_path, format="wav")
                 print(f"✅ Saved to: {output_path}")
-
-                # Debug artifacts: captions + verification transcripts
-                try:
-                    self._export_debug_artifacts(audio_path, output_path, video_path)
-                except Exception as e:
-                    print(f"⚠️  Debug export failed (non-fatal): {e}")
         
         return output_path
     
@@ -878,7 +863,7 @@ class DynamicSpeakerTranslator:
             min_turn_ms=350,
             merge_gap_ms=120,
         )
-
+        segments = self._merge_adjacent_turns(segments, max_gap_ms=400, min_keep_ms=250)
         # call it:
         self._print_segments("RAW", raw_segments)
         self._print_segments("EXCLUSIVE", segments)
@@ -892,6 +877,47 @@ class DynamicSpeakerTranslator:
             print(f"   {speaker_id}: {speaker_counts[speaker_id]} segments")
         
         return segments
+    
+    def _merge_adjacent_turns(
+        self,
+        segments: List[SpeakerSegment],
+        max_gap_ms: int = 400,
+        min_keep_ms: int = 250,
+    ) -> List[SpeakerSegment]:
+        """
+        Merge adjacent segments from the same speaker if separated by <= max_gap_ms.
+        Also drop extremely tiny turns (min_keep_ms).
+        """
+        if not segments:
+            return []
+
+        segs = sorted(segments, key=lambda s: (s.start_ms, s.end_ms))
+        merged: List[SpeakerSegment] = []
+
+        cur = segs[0]
+        for nxt in segs[1:]:
+            same = (nxt.speaker_id == cur.speaker_id)
+            gap = nxt.start_ms - cur.end_ms
+
+            if same and gap <= max_gap_ms:
+                # extend current
+                cur = SpeakerSegment(
+                    cur.speaker_id,
+                    cur.start_ms,
+                    max(cur.end_ms, nxt.end_ms),
+                    cur.start_ms / 1000.0,
+                    max(cur.end_ms, nxt.end_ms) / 1000.0,
+                )
+            else:
+                if (cur.end_ms - cur.start_ms) >= min_keep_ms:
+                    merged.append(cur)
+                cur = nxt
+
+        if (cur.end_ms - cur.start_ms) >= min_keep_ms:
+            merged.append(cur)
+
+        return merged
+
     
     def _make_exclusive_turns(
     self,
@@ -1129,7 +1155,8 @@ class DynamicSpeakerTranslator:
                 audio_np,
                 language=self.source_lang,
                 beam_size=5,
-                vad_filter=False,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=250),
                 condition_on_previous_text=False,
             )
 
@@ -1390,196 +1417,6 @@ class DynamicSpeakerTranslator:
             prev_orig_end = seg.end_ms
 
         return final_audio
-
-    def _ms_to_srt_ts(self, ms: int) -> str:
-        ms = max(0, int(ms))
-        h = ms // 3600000
-        ms -= h * 3600000
-        m = ms // 60000
-        ms -= m * 60000
-        s = ms // 1000
-        ms -= s * 1000
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-    def _ms_to_vtt_ts(self, ms: int) -> str:
-        ms = max(0, int(ms))
-        h = ms // 3600000
-        ms -= h * 3600000
-        m = ms // 60000
-        ms -= m * 60000
-        s = ms // 1000
-        ms -= s * 1000
-        return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
-
-    def _write_srt(self, items, path: str):
-        # items: list[(start_ms, end_ms, text)]
-        lines = []
-        for i, (s, e, text) in enumerate(items, 1):
-            lines.append(str(i))
-            lines.append(f"{self._ms_to_srt_ts(s)} --> {self._ms_to_srt_ts(e)}")
-            lines.append(text.strip())
-            lines.append("")
-        Path(path).write_text("\n".join(lines), encoding="utf-8")
-
-    def _write_vtt(self, items, path: str):
-        # items: list[(start_ms, end_ms, text)]
-        lines = ["WEBVTT", ""]
-        for (s, e, text) in items:
-            lines.append(f"{self._ms_to_vtt_ts(s)} --> {self._ms_to_vtt_ts(e)}")
-            lines.append(text.strip())
-            lines.append("")
-        Path(path).write_text("\n".join(lines), encoding="utf-8")
-
-    def _build_output_timeline_captions(self, segments: List["TranslationSegment"]) -> List[tuple]:
-        """
-        Build captions aligned to the OUTPUT audio timeline.
-        Must match the pause-capping logic in _compose_audio.
-        Returns list of (out_start_ms, out_end_ms, caption_text).
-        """
-        OUTPUT_SR = 24000
-        MAX_PAUSE_MS = 500  # MUST MATCH _compose_audio
-
-        if not segments:
-            return []
-
-        segs = sorted(segments, key=lambda x: x.start_ms)
-
-        out_items = []
-        out_cursor = 0
-        prev_orig_end = segs[0].start_ms  # removes leading silence (matches _compose_audio)
-
-        for seg in segs:
-            orig_gap = seg.start_ms - prev_orig_end
-            pause_ms = max(0, orig_gap)
-            pause_ms = min(pause_ms, MAX_PAUSE_MS)
-
-            out_cursor += pause_ms
-            out_start = out_cursor
-            out_end = out_start + int(seg.duration_ms)
-
-            # Include speaker label so you can visually confirm switching
-            caption_text = f"[{seg.speaker_id}] {seg.translated_text}"
-
-            out_items.append((out_start, out_end, caption_text))
-
-            out_cursor = out_end
-            prev_orig_end = seg.end_ms
-
-        return out_items
-
-    def _transcribe_full_audio_to_srt_and_txt(self, wav_path: str, language: str, out_prefix: str):
-        """
-        Full-file ASR transcript with timestamps -> SRT + TXT.
-        Uses your existing whisper instance (small.en if src=en). Works best for source audio.
-        """
-        from faster_whisper import WhisperModel
-
-        # Use a multilingual model if language isn't English.
-        # This runs only in debug mode; it can be slow.
-        model_name = "small.en" if language == "en" else "small"
-        dbg_whisper = WhisperModel(model_name, device="cpu", compute_type="int8", num_workers=2)
-
-        segs, _ = dbg_whisper.transcribe(
-            wav_path,
-            language=language,
-            beam_size=5,
-            vad_filter=True,
-            condition_on_previous_text=False,
-        )
-
-        items = []
-        full = []
-        for s in segs:
-            txt = (s.text or "").strip()
-            if not txt:
-                continue
-            start_ms = int(s.start * 1000)
-            end_ms = int(s.end * 1000)
-            items.append((start_ms, end_ms, txt))
-            full.append(txt)
-
-        self._write_srt(items, f"{out_prefix}.srt")
-        Path(f"{out_prefix}.txt").write_text(" ".join(full), encoding="utf-8")
-
-    def _transcribe_output_audio_for_validation(self, wav_path: str, language: str, out_txt_path: str) -> str:
-        """
-        ASR the OUTPUT WAV so we can verify what was actually spoken.
-        Returns recognized text.
-        """
-        from faster_whisper import WhisperModel
-
-        dbg_whisper = WhisperModel("small", device="cpu", compute_type="int8", num_workers=2)
-        segs, _ = dbg_whisper.transcribe(
-            wav_path,
-            language=language,
-            beam_size=5,
-            vad_filter=True,
-            condition_on_previous_text=False,
-        )
-
-        parts = []
-        for s in segs:
-            txt = (s.text or "").strip()
-            if txt:
-                parts.append(txt)
-
-        recognized = " ".join(parts)
-        Path(out_txt_path).write_text(recognized, encoding="utf-8")
-        return recognized
-
-    def _simple_similarity(self, a: str, b: str) -> float:
-        """
-        Cheap similarity: token overlap F1-ish.
-        Not perfect, but great for catching obvious missing speech.
-        """
-        import re
-        ta = re.findall(r"\w+", (a or "").lower())
-        tb = re.findall(r"\w+", (b or "").lower())
-        if not ta or not tb:
-            return 0.0
-        sa, sb = set(ta), set(tb)
-        inter = len(sa & sb)
-        prec = inter / max(1, len(sa))
-        rec = inter / max(1, len(sb))
-        if (prec + rec) == 0:
-            return 0.0
-        return 2 * prec * rec / (prec + rec)
-
-    def _export_debug_artifacts(self, original_audio_wav: str, output_wav: str, video_path: str):
-        """
-        Writes:
-        - Output captions aligned to output audio timeline: .srt + .vtt
-        - Full source transcript (independent of diarization): .srt + .txt
-        - Output ASR transcript + similarity score (to see if TTS spoke everything)
-        """
-        stem = Path(video_path).stem
-
-        # 1) Output captions aligned to OUTPUT audio timeline
-        with self.segments_lock:
-            segs = list(self.all_segments)
-        out_caps = self._build_output_timeline_captions(segs)
-        out_srt = f"translated_{stem}_{self.target_lang}.srt"
-        out_vtt = f"translated_{stem}_{self.target_lang}.vtt"
-        self._write_srt(out_caps, out_srt)
-        self._write_vtt(out_caps, out_vtt)
-        print(f"✅ Wrote output captions: {out_srt}, {out_vtt}")
-
-        # 2) Full transcript of ORIGINAL audio (independent check)
-        # Enable with env so you can turn it off when latency matters.
-        if os.getenv("EXPORT_SOURCE_TRANSCRIPT", "1") == "1":
-            src_prefix = f"source_{stem}_{self.source_lang}"
-            self._transcribe_full_audio_to_srt_and_txt(original_audio_wav, self.source_lang, src_prefix)
-            print(f"✅ Wrote source transcript: {src_prefix}.srt, {src_prefix}.txt")
-
-        # 3) ASR the OUTPUT audio and compare to intended translated_text
-        if os.getenv("VALIDATE_OUTPUT_ASR", "1") == "1":
-            expected = " ".join([s.translated_text for s in segs if s.translated_text])
-            out_asr_path = f"output_asr_{stem}_{self.target_lang}.txt"
-            recognized = self._transcribe_output_audio_for_validation(output_wav, self.target_lang, out_asr_path)
-            sim = self._simple_similarity(expected, recognized)
-            print(f"✅ Wrote output ASR transcript: {out_asr_path}")
-            print(f"🔎 Output spoken-vs-expected similarity: {sim:.2f} (lower usually means missing speech or ASR errors)")
-
 
 def main():
     if len(sys.argv) < 2:
