@@ -114,10 +114,114 @@ class SpeakerDiarizer:
         segments = self._merge_close_segments(segments)
         segments = self._split_long_segments(segments, max_duration_sec=25.0)
         segments = self._consolidate_speakers(waveform, sample_rate, segments)
+        segments = self._reattribute_segments(waveform, sample_rate, segments)
         
         unique_speakers = set(seg.speaker_id for seg in segments)
         print(f"✅ Diarization complete: {len(unique_speakers)} speakers, {len(segments)} segments")
         return segments
+    
+    def _reattribute_segments(
+        self,
+        waveform: torch.Tensor,
+        sr: int,
+        segments: List[SpeakerSegment],
+    ) -> List[SpeakerSegment]:
+        """
+        Re-assign each segment to the closest speaker centroid embedding.
+        This fixes occasional speaker-label swaps from diarization.
+        Controlled by env:
+          - SPEAKER_REASSIGN_ENABLE (default 1)
+          - SPEAKER_REASSIGN_MARGIN (default 0.03)
+          - SPEAKER_REASSIGN_MAX_SEC (default 3.0)  # audio per segment to embed
+        """
+        if os.getenv("SPEAKER_REASSIGN_ENABLE", "1") != "1":
+            return segments
+
+        self._load_spkrec()
+        if self._spkrec is None:
+            return segments
+
+        # Group segments by current speaker
+        by_spk: Dict[str, List[SpeakerSegment]] = defaultdict(list)
+        for s in segments:
+            by_spk[s.speaker_id].append(s)
+
+        # Build centroid embedding per speaker from ref audio
+        ref_sec = float(self.merge_config.merge_ref_sec)
+        centroids: Dict[str, np.ndarray] = {}
+        for spk, segs in by_spk.items():
+            ref = self._collect_ref_audio(waveform, sr, segs, target_sec=ref_sec)
+            if ref is None:
+                continue
+            wav = ref.to(self._spkrec_device).float()
+            with torch.no_grad():
+                emb = self._spkrec.encode_batch(wav).squeeze(0).squeeze(0).detach().cpu().numpy()
+            centroids[spk] = emb
+
+        if len(centroids) <= 1:
+            return segments
+
+        margin = float(os.getenv("SPEAKER_REASSIGN_MARGIN", "0.03"))
+        max_sec = float(os.getenv("SPEAKER_REASSIGN_MAX_SEC", "3.0"))
+        max_samples = int(max_sec * sr)
+
+        changed = 0
+        out: List[SpeakerSegment] = []
+
+        for seg in segments:
+            # Skip very short segments for embedding decisions
+            if seg.duration_ms < int(self.merge_config.emb_min_chunk_ms):
+                out.append(seg)
+                continue
+            if seg.speaker_id not in centroids:
+                out.append(seg)
+                continue
+
+            start = int(seg.start_sec * sr)
+            end = int(seg.end_sec * sr)
+            if end <= start:
+                out.append(seg)
+                continue
+
+            chunk = waveform[:, start:end]
+
+            # Limit to max_sec (take the middle to avoid leading/trailing silence)
+            if chunk.shape[1] > max_samples:
+                mid = chunk.shape[1] // 2
+                half = max_samples // 2
+                a = max(0, mid - half)
+                b = min(chunk.shape[1], a + max_samples)
+                chunk = chunk[:, a:b]
+
+            wav = chunk.to(self._spkrec_device).float()
+            with torch.no_grad():
+                seg_emb = self._spkrec.encode_batch(wav).squeeze(0).squeeze(0).detach().cpu().numpy()
+
+            sims = {spk: _cosine_sim(seg_emb, cemb) for spk, cemb in centroids.items()}
+            cur_sim = sims.get(seg.speaker_id, -1.0)
+            best_spk = max(sims, key=sims.get)
+            best_sim = sims[best_spk]
+
+            new_sid = seg.speaker_id
+            if best_spk != seg.speaker_id and (best_sim - cur_sim) >= margin:
+                new_sid = best_spk
+                changed += 1
+
+            out.append(SpeakerSegment(
+                speaker_id=new_sid,
+                start_ms=seg.start_ms,
+                end_ms=seg.end_ms,
+                start_sec=seg.start_sec,
+                end_sec=seg.end_sec,
+            ))
+
+        if changed:
+            print(f"   🔁 Reattributed {changed}/{len(segments)} segments using embeddings (margin={margin})")
+
+        # Merge again after relabel
+        out = self._merge_close_segments(out)
+        return out
+
     
     def _load_spkrec(self):
             """

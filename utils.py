@@ -11,6 +11,7 @@ import librosa
 # Audio feature helpers
 # -------------------------
 
+
 def estimate_pitch_yin(y: np.ndarray, sr: int) -> Optional[float]:
     """Robust-ish median F0 estimate using librosa.yin."""
     y = y.astype(np.float32)
@@ -51,6 +52,10 @@ class TTSConfig:
     xtts_enable: bool = True
     xtts_model_id: str = "tts_models/multilingual/multi-dataset/xtts_v2"
     xtts_device: str = "cpu"
+
+    # Voice-clone reference audio requirements
+    clone_ref_target_sec: float = 15.0  # target seconds to collect per speaker
+    clone_ref_min_sec: float = 6.0      # minimum seconds required to attempt Qwen/XTTS
 
 
 @dataclass(frozen=True)
