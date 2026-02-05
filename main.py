@@ -778,6 +778,10 @@ class DynamicSpeakerTranslator:
                     final_audio = self._compose_audio(self.all_segments, total_duration_sec)
                     final_audio.export(output_path, format="wav")
                     print(f"✅ Saved to: {output_path}")
+
+            print(f"🧪 Input duration:  {total_duration_sec*1000:.0f} ms")
+            print(f"🧪 Output duration: {len(final_audio):.0f} ms")
+            print(f"🧪 Delta: {(len(final_audio) - total_duration_sec*1000):.0f} ms")
             
             return output_path
         
@@ -816,9 +820,80 @@ class DynamicSpeakerTranslator:
             unique_speakers = sorted(set(seg.speaker_id for seg in segments))
             print(f"\n🧬 Preparing local voice cloning for {len(unique_speakers)} speakers...")
 
+            # Optional: embedding-based “clean ref” selection
+            use_clean_ref = os.getenv("CLONE_REF_EMB_SELECT", "1") == "1"
+            ref_min_score = float(os.getenv("CLONE_REF_MIN_SCORE", "0.03"))
+            ref_min_ms = int(os.getenv("CLONE_REF_MIN_MS", "800"))
+            ref_max_seg_sec = float(os.getenv("CLONE_REF_MAX_SEG_SEC", "3.0"))
+            ref_debug = os.getenv("CLONE_REF_DEBUG", "0") == "1"
+            save_ref = os.getenv("CLONE_REF_SAVE", "0") == "1"
+
+            spkrec = None
+            spkrec_device = torch.device("cpu")
+            try:
+                d = getattr(self, "_last_diarizer", None)
+                if d is not None:
+                    d._load_spkrec()
+                    spkrec = d._spkrec
+                    spkrec_device = d._spkrec_device
+            except Exception:
+                spkrec = None
+
+            def _cos(a: np.ndarray, b: np.ndarray) -> float:
+                a = a.astype(np.float32); b = b.astype(np.float32)
+                na = float(np.linalg.norm(a) + 1e-9)
+                nb = float(np.linalg.norm(b) + 1e-9)
+                return float(np.dot(a, b) / (na * nb))
+
+            def _embed_chunk(wav: torch.Tensor) -> Optional[np.ndarray]:
+                if spkrec is None:
+                    return None
+                wav = wav.to(spkrec_device).float()
+                with torch.no_grad():
+                    emb = spkrec.encode_batch(wav).squeeze(0).squeeze(0).detach().cpu().numpy()
+                return emb
+            
+            centroids = {}
+            if use_clean_ref and spkrec is not None:
+                by_spk = {sid: [s for s in segments if s.speaker_id == sid] for sid in unique_speakers}
+
+                # Build centroid from the longest segments first (more stable)
+                for sid, segs in by_spk.items():
+                    segs_sorted = sorted(segs, key=lambda s: (s.duration_ms), reverse=True)
+                    total = 0.0
+                    chunks = []
+                    for s in segs_sorted:
+                        if total >= float(self.speaker_merge.merge_ref_sec):
+                            break
+                        if s.duration_ms < ref_min_ms:
+                            continue
+                        a = int(s.start_sec * sample_rate)
+                        b = int(s.end_sec * sample_rate)
+                        chunk = audio[:, a:b]
+                        # cap per-segment chunk length to avoid boundary contamination
+                        max_samples = int(ref_max_seg_sec * sample_rate)
+                        if chunk.shape[1] > max_samples:
+                            mid = chunk.shape[1] // 2
+                            half = max_samples // 2
+                            x0 = max(0, mid - half)
+                            x1 = min(chunk.shape[1], x0 + max_samples)
+                            chunk = chunk[:, x0:x1]
+
+                        chunks.append(chunk)
+                        total += chunk.shape[1] / sample_rate
+
+                    if chunks:
+                        ref = torch.cat(chunks, dim=1)
+                        emb = _embed_chunk(ref)
+                        if emb is not None:
+                            centroids[sid] = emb
+
             # Collect reference audio per speaker (used by both Qwen and XTTS)
             for speaker_id in unique_speakers:
                 speaker_segments = [s for s in segments if s.speaker_id == speaker_id]
+
+                # Default fallback behavior (if embeddings aren’t available)
+                selected = []
 
                 collected = []
                 total = 0.0
@@ -910,13 +985,14 @@ class DynamicSpeakerTranslator:
             
             hf_token = _get_hf_token_from_env()
             diarizer = SpeakerDiarizer(hf_token, merge_config=self.speaker_merge)
+            self._last_diarizer = diarizer
             raw_segments = diarizer.diarize(audio, self.sample_rate)
 
             segments = self._make_exclusive_turns(
                 raw_segments,
-                solo_keep_ms=250,
+                solo_keep_ms=500,
                 ignore_interruptions_ms=900,
-                min_turn_ms=350,
+                min_turn_ms=550,
                 merge_gap_ms=120,
             )
             segments = self._merge_adjacent_turns(segments, max_gap_ms=400, min_keep_ms=250)
@@ -1072,7 +1148,8 @@ class DynamicSpeakerTranslator:
             for spk, s, e, _solo_ms in merged2:
                 if (e - s) < min_turn_ms:
                     continue
-                out.append(SpeakerSegment(spk, s, e, s / 1000.0, e / 1000.0))
+                PAD_MS = int(os.getenv("TURN_PAD_MS", "120"))  # 80–200 works well
+                out.append(SpeakerSegment(spk, s, e + PAD_MS, s/1000.0, (e + PAD_MS)/1000.0))
 
             out.sort(key=lambda x: x.start_ms)
             return out
@@ -1180,251 +1257,342 @@ class DynamicSpeakerTranslator:
             return wav_bytes, duration_ms
 
     def _process_single_segment(
-            self,
-            idx: int,
-            seg: SpeakerSegment,
-            audio: torch.Tensor,
-        ) -> Optional[TranslationSegment]:
-            """
-            Process one diarized segment: ASR -> translate -> TTS -> TranslationSegment.
+        self,
+        idx: int,
+        seg: SpeakerSegment,
+        audio: torch.Tensor,
+    ) -> Optional[TranslationSegment]:
+        """
+        Process one diarized segment: ASR -> translate -> TTS -> TranslationSegment.
 
-            Safe behaviors:
-            - XTTS: chunk long text to avoid truncation (common ~239 char limit warning)
-            - Concatenate chunk WAVs cleanly
-            - Falls back to ElevenLabs stock voice if Qwen/XTTS fails
-            """
-            try:
-                # ----------------------------
-                # 1) Slice waveform for ASR
-                # ----------------------------
-                start_sample = int(seg.start_sec * self.sample_rate)
-                end_sample = int(seg.end_sec * self.sample_rate)
-                if end_sample <= start_sample:
-                    return None
-
-                segment_audio = audio[:, start_sample:end_sample]
-                audio_np = segment_audio.squeeze().numpy()
-
-                # ----------------------------
-                # 2) ASR (Faster-Whisper)
-                # ----------------------------
-                segments_whisper, _ = self.whisper.transcribe(
-                    audio_np,
-                    language=self.source_lang,
-                    beam_size=5,
-                    vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=250),
-                    condition_on_previous_text=False,
-                )
-
-                text_parts = [s.text.strip() for s in segments_whisper if s.text and s.text.strip()]
-                if not text_parts:
-                    print(f"   ⚠️  No ASR text for {seg.speaker_id} (segment {idx}, {seg.end_ms - seg.start_ms}ms) — skipping")
-                    return None
-
-                original_text = " ".join(text_parts)
-
-                # ----------------------------
-                # 3) Translate
-                # ----------------------------
-                if not self.use_local_translation:
-                    translated_text = self.translator.translate(original_text)
-                else:
-                    tokens = self.tokenizer([original_text], return_tensors="pt", padding=True)
-                    translated = self.translation_model.generate(**tokens)
-                    translated_text = self.tokenizer.decode(translated[0], skip_special_tokens=True)
-
-                # ----------------------------
-                # Helpers: chunking + wav concat
-                # ----------------------------
-                def _chunk_text_for_tts(text: str, max_chars: int) -> List[str]:
-                    """
-                    Chunk text to <= max_chars, preferring to split at punctuation/space.
-                    Keeps it simple and robust.
-                    """
-                    text = " ".join(text.split())
-                    if len(text) <= max_chars:
-                        return [text]
-
-                    chunks: List[str] = []
-                    s = text
-                    preferred_breaks = [". ", "! ", "? ", "; ", ": ", ", ", " — ", " - "]
-
-                    while len(s) > max_chars:
-                        window = s[: max_chars + 1]
-
-                        cut = -1
-                        # Try preferred punctuation boundaries first
-                        for br in preferred_breaks:
-                            pos = window.rfind(br)
-                            if pos != -1 and pos >= int(max_chars * 0.55):
-                                cut = pos + len(br)
-                                break
-
-                        # Fallback: last space
-                        if cut == -1:
-                            pos = window.rfind(" ")
-                            if pos != -1 and pos >= int(max_chars * 0.55):
-                                cut = pos + 1
-
-                        # Hard fallback: forced cut
-                        if cut == -1:
-                            cut = max_chars
-
-                        chunk = s[:cut].strip()
-                        if chunk:
-                            chunks.append(chunk)
-                        s = s[cut:].strip()
-
-                    if s:
-                        chunks.append(s)
-
-                    return chunks
-
-                def _concat_wav_bytes(wav_list: List[bytes], silence_ms: int = 50) -> bytes:
-                    """
-                    Concatenate multiple WAV byte blobs into one WAV (24kHz mono),
-                    inserting short silence between chunks.
-                    """
-                    if not wav_list:
-                        raise ValueError("No wav chunks to concatenate")
-
-                    out = AudioSegment.silent(duration=0, frame_rate=24000)
-                    gap = AudioSegment.silent(duration=int(silence_ms), frame_rate=24000)
-
-                    for i, wb in enumerate(wav_list):
-                        seg_audio = AudioSegment.from_wav(io.BytesIO(wb))
-                        seg_audio = seg_audio.set_frame_rate(24000).set_channels(1)
-                        # tiny fades to prevent clicks
-                        seg_audio = seg_audio.fade_in(10).fade_out(10)
-                        if i > 0 and silence_ms > 0:
-                            out += gap
-                        out += seg_audio
-
-                    bio = io.BytesIO()
-                    out.export(bio, format="wav")
-                    return bio.getvalue()
-
-                # You can tune these via env vars:
-                # - XTTS_MAX_CHARS (default 220)
-                # - XTTS_CHUNK_SILENCE_MS (default 50)
-                lang_default_limits = {
-                    "es": 220,
-                    "en": 260,
-                    "fr": 220,
-                    "de": 220,
-                    "it": 220,
-                    "pt": 220,
-                }
-                xtts_max_chars = int(os.getenv("XTTS_MAX_CHARS", str(lang_default_limits.get(self.target_lang, 220))))
-                xtts_silence_ms = int(os.getenv("XTTS_CHUNK_SILENCE_MS", "50"))
-
-                # ----------------------------
-                # 4) TTS (Qwen -> XTTS -> Eleven)
-                # ----------------------------
-                wav_bytes: Optional[bytes] = None
-                duration_ms: Optional[int] = None
-
-                # 4A) Primary: Qwen local clone (lazy-load; only if language supported)
-                if self.use_voice_cloning:
-                    ref_seconds = float(self.speaker_ref_sec.get(seg.speaker_id, 0.0))
-                    min_required = float(os.getenv("CLONE_MIN_SECONDS", str(self.tts_config.clone_ref_min_sec)))
-                    has_ref_audio = (seg.speaker_id in self.speaker_ref_wav) and (ref_seconds >= min_required)
-
-                    # If we don't have enough reference audio, skip both Qwen + XTTS and go straight to ElevenLabs.
-                    if has_ref_audio:
-                        # Try Qwen first IF it supports the target language; otherwise fall through to XTTS.
-                        qwen_lang_ok = False
-                        if self.tts_config.qwen_enable and self._ensure_qwen_loaded():
-                            qwen_lang_ok = self.qwen_cloner.supports_lang(self.target_lang)
-
-                        if qwen_lang_ok:
-                            # Lazily create per-speaker prompt if missing
-                            if seg.speaker_id not in self.speaker_qwen_prompt:
-                                with self._qwen_prompt_lock:
-                                    # check again inside the lock to avoid races
-                                    if seg.speaker_id not in self.speaker_qwen_prompt:
-                                        try:
-                                            ref_wav = self.speaker_ref_wav.get(seg.speaker_id)
-                                            ref_np, ref_sr = _audio_np_from_wav_bytes(ref_wav) if ref_wav else (None, None)
-
-                                            prompt = None
-                                            if ref_np is not None and len(ref_np) > 0:
-                                                prompt = self.qwen_cloner.create_prompt(
-                                                    ref_np,
-                                                    int(ref_sr or self.sample_rate),
-                                                    self.speaker_ref_text.get(seg.speaker_id, "") or "",
-                                                )
-
-                                            if prompt is not None:
-                                                self.speaker_qwen_prompt[seg.speaker_id] = prompt
-                                                print(f"   ✅ {seg.speaker_id}: Qwen prompt created (lazy)")
-                                        except Exception as e:
-                                            print(f"   ⚠️  Qwen prompt creation failed for {seg.speaker_id}: {e}")
-
-                            prompt = self.speaker_qwen_prompt.get(seg.speaker_id)
-                            if prompt is not None:
-                                try:
-                                    qwen_bytes = self.qwen_cloner.synthesize(translated_text, self.target_lang, prompt)
-                                    if qwen_bytes:
-                                        wav_bytes, duration_ms = self._tts_bytes_to_wav(qwen_bytes, output_sr=24000)
-                                except Exception as e:
-                                    print(f"   ⚠️  Qwen TTS failed for {seg.speaker_id} (segment {idx}): {e}")
-
-                        # 4B) Backup: XTTS local clone (only if language supported)
-                        if wav_bytes is None and self.tts_config.xtts_enable:
-                            if self._ensure_xtts_loaded() and self.xtts_cloner.supports_lang(self.target_lang):
-                                try:
-                                    ref_wav = self.speaker_ref_wav.get(seg.speaker_id)
-                                    if not ref_wav:
-                                        raise ValueError("missing speaker reference wav")
-                                    chunks = _chunk_text_for_tts(translated_text, xtts_max_chars)
-                                    xtts_wavs: List[bytes] = []
-                                    for c in chunks:
-                                        xtts_bytes = self.xtts_cloner.synthesize(c, self.target_lang, ref_wav)
-                                        if not xtts_bytes:
-                                            raise ValueError("XTTS returned empty bytes")
-                                        w, _dur = self._tts_bytes_to_wav(xtts_bytes, output_sr=24000)
-                                        xtts_wavs.append(w)
-                                    wav_bytes = _concat_wav_bytes(xtts_wavs, silence_ms=xtts_silence_ms)
-                                    wav_bytes, duration_ms = self._tts_bytes_to_wav(wav_bytes, output_sr=24000)
-                                except Exception as e:
-                                    print(f"   ⚠️  XTTS failed for {seg.speaker_id} (segment {idx}): {e}")
-                                    wav_bytes = None
-                                    duration_ms = None
-
-                # 4C) Absolute last resort: ElevenLabs stock voice
-
-                if wav_bytes is None:
-                    voice_id = self.speaker_voice_ids.get(seg.speaker_id)
-                    if not voice_id:
-                        print(f"   ⚠️  No voice_id for {seg.speaker_id} (segment {idx}) — skipping")
-                        return None
-
-                    audio_generator = self.elevenlabs.text_to_speech.convert(
-                        voice_id=voice_id,
-                        text=translated_text,
-                        model_id="eleven_multilingual_v2",
-                        voice_settings=self.voice_settings,
-                    )
-                    eleven_bytes = b"".join(audio_generator)
-                    wav_bytes, duration_ms = self._tts_bytes_to_wav(eleven_bytes, output_sr=24000)
-
-                assert wav_bytes is not None and duration_ms is not None
-
-                return TranslationSegment(
-                    speaker_id=seg.speaker_id,
-                    start_ms=seg.start_ms,
-                    end_ms=seg.end_ms,
-                    original_text=original_text,
-                    translated_text=translated_text,
-                    audio_bytes=wav_bytes,
-                    duration_ms=duration_ms,
-                )
-
-            except Exception as e:
-                print(f"   ⚠️  Segment {idx} error: {e}")
+        Fix (1): ONLY apply duration/trim logic AFTER wav_bytes + duration_ms exist.
+        This prevents: "'>' not supported between instances of 'NoneType' and 'int'".
+        """
+        try:
+            # ----------------------------
+            # 1) Slice waveform for ASR
+            # ----------------------------
+            start_sample = int(seg.start_sec * self.sample_rate)
+            end_sample = int(seg.end_sec * self.sample_rate)
+            if end_sample <= start_sample:
                 return None
+
+            segment_audio = audio[:, start_sample:end_sample]
+            audio_np = segment_audio.squeeze().numpy()
+
+            # ----------------------------
+            # 2) ASR (Faster-Whisper)
+            # ----------------------------
+            segments_whisper, _ = self.whisper.transcribe(
+                audio_np,
+                language=self.source_lang,
+                beam_size=5,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=250),
+                condition_on_previous_text=False,
+            )
+
+            text_parts = [s.text.strip() for s in segments_whisper if s.text and s.text.strip()]
+            if not text_parts:
+                print(f"   ⚠️  No ASR text for {seg.speaker_id} (segment {idx}, {seg.end_ms - seg.start_ms}ms) — skipping")
+                return None
+
+            original_text = " ".join(text_parts)
+
+            # ----------------------------
+            # 3) Translate
+            # ----------------------------
+            if not self.use_local_translation:
+                translated_text = self.translator.translate(original_text)
+            else:
+                tokens = self.tokenizer([original_text], return_tensors="pt", padding=True)
+                translated = self.translation_model.generate(**tokens)
+                translated_text = self.tokenizer.decode(translated[0], skip_special_tokens=True)
+
+            # ----------------------------
+            # Helpers
+            # ----------------------------
+            def _chunk_text_for_tts(text: str, max_chars: int) -> List[str]:
+                text = " ".join(text.split())
+                if len(text) <= max_chars:
+                    return [text]
+
+                chunks: List[str] = []
+                s = text
+                preferred_breaks = [". ", "! ", "? ", "; ", ": ", ", ", " — ", " - "]
+
+                while len(s) > max_chars:
+                    window = s[: max_chars + 1]
+                    cut = -1
+
+                    for br in preferred_breaks:
+                        pos = window.rfind(br)
+                        if pos != -1 and pos >= int(max_chars * 0.55):
+                            cut = pos + len(br)
+                            break
+
+                    if cut == -1:
+                        pos = window.rfind(" ")
+                        if pos != -1 and pos >= int(max_chars * 0.55):
+                            cut = pos + 1
+
+                    if cut == -1:
+                        cut = max_chars
+
+                    chunk = s[:cut].strip()
+                    if chunk:
+                        chunks.append(chunk)
+                    s = s[cut:].strip()
+
+                if s:
+                    chunks.append(s)
+
+                return chunks
+
+            def _concat_wav_bytes(wav_list: List[bytes], silence_ms: int = 50) -> bytes:
+                if not wav_list:
+                    raise ValueError("No wav chunks to concatenate")
+
+                out = AudioSegment.silent(duration=0, frame_rate=24000)
+                gap = AudioSegment.silent(duration=int(silence_ms), frame_rate=24000)
+
+                for i, wb in enumerate(wav_list):
+                    seg_audio = AudioSegment.from_wav(io.BytesIO(wb))
+                    seg_audio = seg_audio.set_frame_rate(24000).set_channels(1)
+                    seg_audio = seg_audio.fade_in(10).fade_out(10)
+                    if i > 0 and silence_ms > 0:
+                        out += gap
+                    out += seg_audio
+
+                bio = io.BytesIO()
+                out.export(bio, format="wav")
+                return bio.getvalue()
+
+            def _fit_tts_to_original(wav_bytes: bytes, tts_ms: int, orig_ms: int) -> tuple[bytes, int]:
+                """
+                Fit TTS audio into the diarized segment duration *without cutting words* when possible.
+
+                Strategy:
+                - If close enough: keep as-is
+                - If too long: time-stretch slightly faster (preferred)
+                - If too short: pad with silence at end
+                - If stretch would be extreme: truncate as last resort (with fade)
+                """
+                # Safety
+                if not wav_bytes or tts_ms is None or orig_ms is None or orig_ms <= 0:
+                    return wav_bytes, tts_ms
+
+                # Allow a little natural drift (sports cadence varies)
+                # If within 5%, don't touch it.
+                if abs(tts_ms - orig_ms) <= int(orig_ms * 0.05):
+                    return wav_bytes, tts_ms
+
+                # Hard bounds on how much we’ll time-stretch.
+                # rate > 1.0 = faster (shorter); rate < 1.0 = slower (longer)
+                MAX_RATE_UP = float(os.getenv("TTS_MAX_RATE_UP", "1.25"))   # up to 25% faster
+                MAX_RATE_DOWN = float(os.getenv("TTS_MAX_RATE_DOWN", "0.90"))  # allow ~10% slower if too short
+                FADE_MS = int(os.getenv("TTS_FADE_MS", "25"))
+
+                # Decode WAV bytes to float32 numpy
+                try:
+                    y, sr = torchaudio.load(io.BytesIO(wav_bytes))  # y: [ch, time]
+                    if y.shape[0] > 1:
+                        y = torch.mean(y, dim=0, keepdim=True)
+                    y = y.squeeze(0).detach().cpu().numpy().astype(np.float32)
+                    sr = int(sr)
+                except Exception:
+                    # If decode fails, fall back to truncate/pad using pydub
+                    a = AudioSegment.from_wav(io.BytesIO(wav_bytes))
+                    if len(a) > orig_ms:
+                        a = a[:orig_ms].fade_out(FADE_MS)
+                    elif len(a) < orig_ms:
+                        a = a + AudioSegment.silent(duration=(orig_ms - len(a)), frame_rate=a.frame_rate)
+                    bio = io.BytesIO()
+                    a.export(bio, format="wav")
+                    return bio.getvalue(), orig_ms
+
+                # Avoid stretching tiny clips (can sound awful)
+                if orig_ms < 400 or tts_ms < 400:
+                    a = AudioSegment.from_wav(io.BytesIO(wav_bytes))
+                    if len(a) > orig_ms:
+                        a = a[:orig_ms].fade_out(FADE_MS)
+                    elif len(a) < orig_ms:
+                        a = a + AudioSegment.silent(duration=(orig_ms - len(a)), frame_rate=a.frame_rate)
+                    bio = io.BytesIO()
+                    a.export(bio, format="wav")
+                    return bio.getvalue(), orig_ms
+
+                # If TTS is longer, speed it up (time-stretch) to fit
+                if tts_ms > orig_ms:
+                    # We need duration shrink => rate > 1
+                    desired_rate = tts_ms / orig_ms  # e.g., 1200/1000 = 1.2 (20% faster)
+                    rate = min(desired_rate, MAX_RATE_UP)
+
+                    # If even max speed-up still leaves it too long, we’ll stretch then truncate tail lightly.
+                    try:
+                        # librosa expects float32 [-1, 1] generally; your audio is already float32
+                        y2 = librosa.effects.time_stretch(y, rate=rate)
+
+                        # Convert back to WAV bytes at same SR
+                        wav2 = _wav_bytes_from_audio_np(y2, sr)
+
+                        # Now check final ms and trim/pad precisely with pydub (easy + consistent)
+                        a = AudioSegment.from_wav(io.BytesIO(wav2)).set_frame_rate(24000).set_channels(1)
+                        if len(a) > orig_ms:
+                            # last resort micro-trim to exact slot
+                            a = a[:orig_ms].fade_out(FADE_MS)
+                        elif len(a) < orig_ms:
+                            a = a + AudioSegment.silent(duration=(orig_ms - len(a)), frame_rate=a.frame_rate)
+
+                        a = a.fade_in(min(FADE_MS, 10)).fade_out(FADE_MS)
+                        bio = io.BytesIO()
+                        a.export(bio, format="wav")
+                        return bio.getvalue(), orig_ms
+
+                    except Exception:
+                        # fallback: truncate
+                        a = AudioSegment.from_wav(io.BytesIO(wav_bytes))
+                        a = a[:orig_ms].fade_out(FADE_MS)
+                        bio = io.BytesIO()
+                        a.export(bio, format="wav")
+                        return bio.getvalue(), orig_ms
+
+                # If TTS is shorter, pad (optionally slow down slightly, but padding is safer)
+                else:
+                    a = AudioSegment.from_wav(io.BytesIO(wav_bytes)).set_frame_rate(24000).set_channels(1)
+
+                    # Optional: if it's moderately short, you *can* slow down a bit (rate < 1.0),
+                    # but slowing down often hurts intelligibility more than padding.
+                    # So we mostly pad.
+                    if len(a) < orig_ms:
+                        a = a + AudioSegment.silent(duration=(orig_ms - len(a)), frame_rate=a.frame_rate)
+
+                    a = a.fade_in(min(FADE_MS, 10)).fade_out(FADE_MS)
+                    bio = io.BytesIO()
+                    a.export(bio, format="wav")
+                    return bio.getvalue(), orig_ms
+
+
+            # TTS chunking knobs
+            lang_default_limits = {
+                "es": 220,
+                "en": 260,
+                "fr": 220,
+                "de": 220,
+                "it": 220,
+                "pt": 220,
+            }
+            xtts_max_chars = int(os.getenv("XTTS_MAX_CHARS", str(lang_default_limits.get(self.target_lang, 220))))
+            xtts_silence_ms = int(os.getenv("XTTS_CHUNK_SILENCE_MS", "50"))
+
+            # ----------------------------
+            # 4) TTS (Qwen -> XTTS -> Eleven)
+            # ----------------------------
+            wav_bytes: Optional[bytes] = None
+            duration_ms: Optional[int] = None
+            orig_ms = int(seg.end_ms - seg.start_ms)
+
+            # 4A) Qwen local clone
+            if self.use_voice_cloning:
+                ref_seconds = float(self.speaker_ref_sec.get(seg.speaker_id, 0.0))
+                min_required = float(os.getenv("CLONE_MIN_SECONDS", str(self.tts_config.clone_ref_min_sec)))
+                has_ref_audio = (seg.speaker_id in self.speaker_ref_wav) and (ref_seconds >= min_required)
+
+                if has_ref_audio:
+                    qwen_lang_ok = False
+                    if self.tts_config.qwen_enable and self._ensure_qwen_loaded():
+                        qwen_lang_ok = self.qwen_cloner.supports_lang(self.target_lang)
+
+                    if qwen_lang_ok:
+                        if seg.speaker_id not in self.speaker_qwen_prompt:
+                            with self._qwen_prompt_lock:
+                                if seg.speaker_id not in self.speaker_qwen_prompt:
+                                    try:
+                                        ref_wav = self.speaker_ref_wav.get(seg.speaker_id)
+                                        ref_np, ref_sr = _audio_np_from_wav_bytes(ref_wav) if ref_wav else (None, None)
+
+                                        prompt = None
+                                        if ref_np is not None and len(ref_np) > 0:
+                                            prompt = self.qwen_cloner.create_prompt(
+                                                ref_np,
+                                                int(ref_sr or self.sample_rate),
+                                                self.speaker_ref_text.get(seg.speaker_id, "") or "",
+                                            )
+
+                                        if prompt is not None:
+                                            self.speaker_qwen_prompt[seg.speaker_id] = prompt
+                                            print(f"   ✅ {seg.speaker_id}: Qwen prompt created (lazy)")
+                                    except Exception as e:
+                                        print(f"   ⚠️  Qwen prompt creation failed for {seg.speaker_id}: {e}")
+
+                        prompt = self.speaker_qwen_prompt.get(seg.speaker_id)
+                        if prompt is not None:
+                            try:
+                                qwen_bytes = self.qwen_cloner.synthesize(translated_text, self.target_lang, prompt)
+                                if qwen_bytes:
+                                    wav_bytes, duration_ms = self._tts_bytes_to_wav(qwen_bytes, output_sr=24000)
+                                    wav_bytes, duration_ms = _fit_tts_to_original(wav_bytes, duration_ms, orig_ms)
+                            except Exception as e:
+                                print(f"   ⚠️  Qwen TTS failed for {seg.speaker_id} (segment {idx}): {e}")
+
+                    # 4B) XTTS backup clone
+                    if wav_bytes is None and self.tts_config.xtts_enable:
+                        if self._ensure_xtts_loaded() and self.xtts_cloner.supports_lang(self.target_lang):
+                            try:
+                                ref_wav = self.speaker_ref_wav.get(seg.speaker_id)
+                                if not ref_wav:
+                                    raise ValueError("missing speaker reference wav")
+
+                                chunks = _chunk_text_for_tts(translated_text, xtts_max_chars)
+                                xtts_wavs: List[bytes] = []
+                                for c in chunks:
+                                    xtts_bytes = self.xtts_cloner.synthesize(c, self.target_lang, ref_wav)
+                                    if not xtts_bytes:
+                                        raise ValueError("XTTS returned empty bytes")
+                                    w, _dur = self._tts_bytes_to_wav(xtts_bytes, output_sr=24000)
+                                    xtts_wavs.append(w)
+
+                                wav_bytes = _concat_wav_bytes(xtts_wavs, silence_ms=xtts_silence_ms)
+                                wav_bytes, duration_ms = self._tts_bytes_to_wav(wav_bytes, output_sr=24000)
+                                wav_bytes, duration_ms = _fit_tts_to_original(wav_bytes, duration_ms, orig_ms)
+                            except Exception as e:
+                                print(f"   ⚠️  XTTS failed for {seg.speaker_id} (segment {idx}): {e}")
+                                wav_bytes = None
+                                duration_ms = None
+
+            # 4C) ElevenLabs last resort
+            if wav_bytes is None:
+                voice_id = self.speaker_voice_ids.get(seg.speaker_id)
+                if not voice_id:
+                    print(f"   ⚠️  No voice_id for {seg.speaker_id} (segment {idx}) — skipping")
+                    return None
+
+                audio_generator = self.elevenlabs.text_to_speech.convert(
+                    voice_id=voice_id,
+                    text=translated_text,
+                    model_id="eleven_multilingual_v2",
+                    voice_settings=self.voice_settings,
+                )
+                eleven_bytes = b"".join(audio_generator)
+                wav_bytes, duration_ms = self._tts_bytes_to_wav(eleven_bytes, output_sr=24000)
+                wav_bytes, duration_ms = _fit_tts_to_original(wav_bytes, duration_ms, orig_ms)
+
+            assert wav_bytes is not None and duration_ms is not None
+
+            return TranslationSegment(
+                speaker_id=seg.speaker_id,
+                start_ms=seg.start_ms,
+                end_ms=seg.end_ms,
+                original_text=original_text,
+                translated_text=translated_text,
+                audio_bytes=wav_bytes,
+                duration_ms=duration_ms,
+            )
+
+        except Exception as e:
+            print(f"   ⚠️  Segment {idx} error: {e}")
+            return None
+
 
     def _playback_thread(self, buffer_count: int):
             """Playback thread (matches concat + clipped-gaps compose policy)."""
@@ -1483,32 +1651,90 @@ class DynamicSpeakerTranslator:
                 self.error_occurred.set()
                 print(f"\n❌ Playback error: {e}")
 
-        
     def _compose_audio(self, segments, total_duration_sec):
-            OUTPUT_SR = 24000
-            MAX_PAUSE_MS = 500  # tune 300–800
+        OUTPUT_SR = 24000
 
-            if not segments:
-                return AudioSegment.silent(duration=0, frame_rate=OUTPUT_SR)
+        if not segments:
+            return AudioSegment.silent(duration=int(total_duration_sec * 1000), frame_rate=OUTPUT_SR)
 
-            final_audio = AudioSegment.silent(duration=0, frame_rate=OUTPUT_SR)
-            prev_orig_end = segments[0].start_ms  # removes leading silence
+        # Make a full-length silent bed
+        total_ms = int(total_duration_sec * 1000)
+        final_audio = AudioSegment.silent(duration=total_ms, frame_rate=OUTPUT_SR)
 
-            for seg in segments:
-                seg_audio = AudioSegment.from_wav(io.BytesIO(seg.audio_bytes))
-                seg_audio = seg_audio.set_frame_rate(OUTPUT_SR).set_channels(1)
+        for seg in segments:
+            seg_audio = AudioSegment.from_wav(io.BytesIO(seg.audio_bytes))
+            seg_audio = seg_audio.set_frame_rate(OUTPUT_SR).set_channels(1)
 
-                orig_gap = seg.start_ms - prev_orig_end
-                pause_ms = max(0, orig_gap)
-                pause_ms = min(pause_ms, MAX_PAUSE_MS)
+            # Optional: avoid clicks
+            seg_audio = seg_audio.fade_in(10).fade_out(10)
 
-                if pause_ms:
-                    final_audio += AudioSegment.silent(duration=pause_ms, frame_rate=OUTPUT_SR)
+            # Place at the ORIGINAL time
+            pos = max(0, int(seg.start_ms))
+            final_audio = final_audio.overlay(seg_audio, position=pos)
 
-                final_audio += seg_audio
-                prev_orig_end = seg.end_ms
+        return final_audio
+    
+    def translate_audio_file_no_playback(self, wav_path: str):
+        """
+        Server-friendly entrypoint:
+        - no playback thread
+        - returns (mp3_bytes, captions_list)
+        """
+        audio, sr = torchaudio.load(wav_path)
 
-            return final_audio
+        if audio.shape[0] > 1:
+            audio = torch.mean(audio, dim=0, keepdim=True)
+
+        if sr != self.sample_rate:
+            resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
+            audio = resampler(audio)
+
+        total_duration_sec = audio.shape[1] / self.sample_rate
+
+        speaker_segments = self._get_speaker_segments(audio, wav_path)
+
+        if self.use_voice_cloning:
+            self.speaker_voice_ids = self._create_speaker_voice_clones(
+                audio, speaker_segments, self.sample_rate
+            )
+        else:
+            self.speaker_voice_ids = self.voice_manager.assign_voices(
+                audio, speaker_segments, self.sample_rate
+            )
+
+        # Process segments (parallel) but we won't play them.
+        self._process_segments_parallel(audio, speaker_segments)
+
+        # Drain queue if you want; we rely on self.all_segments for final assembly
+        # while not self.playback_queue.empty():
+        #     _ = self.playback_queue.get_nowait()
+        #     self.playback_queue.task_done()
+
+        with self.segments_lock:
+            segments = list(self.all_segments)
+
+        final_audio = self._compose_audio(segments, total_duration_sec)
+
+        # Export MP3 bytes for the frontend
+        mp3_io = io.BytesIO()
+        final_audio.export(mp3_io, format="mp3")
+        mp3_bytes = mp3_io.getvalue()
+
+        # Captions shaped for CommentaryPlayer.jsx
+        captions = [
+            {
+                "speaker": s.speaker_id,
+                "startTime": s.start_ms / 1000.0,
+                "endTime": s.end_ms / 1000.0,
+                "original": s.original_text,
+                "translated": s.translated_text,
+            }
+            for s in segments
+        ]
+
+        return mp3_bytes, captions
+
+
 
 def _build_arg_parser():
     import argparse
@@ -1578,6 +1804,7 @@ def main():
     )
 
     output = translator.translate_video_streaming(args.video)
+    
     print(f"🎉 Complete! Output: {output}")
 
 

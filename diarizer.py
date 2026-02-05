@@ -131,11 +131,17 @@ class SpeakerDiarizer:
         This fixes occasional speaker-label swaps from diarization.
         Controlled by env:
           - SPEAKER_REASSIGN_ENABLE (default 1)
-          - SPEAKER_REASSIGN_MARGIN (default 0.03)
+          - SPEAKER_REASSIGN_MARGIN (default 0.06)
           - SPEAKER_REASSIGN_MAX_SEC (default 3.0)  # audio per segment to embed
         """
         if os.getenv("SPEAKER_REASSIGN_ENABLE", "1") != "1":
             return segments
+        debug = os.getenv("SPEAKER_REASSIGN_DEBUG", "0") == "1"
+        # More conservative gates (defaults are safe for sports)
+        min_ms = int(os.getenv("SPEAKER_REASSIGN_MIN_MS", "900"))          # don’t flip tiny segments
+        top2_margin = float(os.getenv("SPEAKER_REASSIGN_TOP2_MARGIN", "0.03"))  # top1 must beat top2
+        min_best_sim = float(os.getenv("SPEAKER_REASSIGN_MIN_BEST_SIM", "0.55")) # absolute confidence gate
+        boundary_ms = int(os.getenv("SPEAKER_REASSIGN_BOUNDARY_MS", "150"))      # optional boundary skip
 
         self._load_spkrec()
         if self._spkrec is None:
@@ -161,18 +167,29 @@ class SpeakerDiarizer:
         if len(centroids) <= 1:
             return segments
 
-        margin = float(os.getenv("SPEAKER_REASSIGN_MARGIN", "0.03"))
+        margin = float(os.getenv("SPEAKER_REASSIGN_MARGIN", "0.06"))
         max_sec = float(os.getenv("SPEAKER_REASSIGN_MAX_SEC", "3.0"))
         max_samples = int(max_sec * sr)
 
         changed = 0
         out: List[SpeakerSegment] = []
+        segments_sorted = sorted(segments, key=lambda s: (s.start_ms, s.end_ms))
 
-        for seg in segments:
+        for i, seg in enumerate(segments_sorted):
             # Skip very short segments for embedding decisions
             if seg.duration_ms < int(self.merge_config.emb_min_chunk_ms):
                 out.append(seg)
                 continue
+            # Optional: skip boundary segments (likely turn-taking / overlap edges)
+            if boundary_ms > 0:
+                prev_seg = segments_sorted[i - 1] if i > 0 else None
+                next_seg = segments_sorted[i + 1] if i + 1 < len(segments_sorted) else None
+                if prev_seg and prev_seg.speaker_id != seg.speaker_id and abs(seg.start_ms - prev_seg.end_ms) <= boundary_ms:
+                    out.append(seg)
+                    continue
+                if next_seg and next_seg.speaker_id != seg.speaker_id and abs(next_seg.start_ms - seg.end_ms) <= boundary_ms:
+                    out.append(seg)
+                    continue
             if seg.speaker_id not in centroids:
                 out.append(seg)
                 continue
@@ -198,14 +215,34 @@ class SpeakerDiarizer:
                 seg_emb = self._spkrec.encode_batch(wav).squeeze(0).squeeze(0).detach().cpu().numpy()
 
             sims = {spk: _cosine_sim(seg_emb, cemb) for spk, cemb in centroids.items()}
+            sims_sorted = sorted(sims.items(), key=lambda kv: kv[1], reverse=True)
+
+            (best_spk, best_sim) = sims_sorted[0]
+            (_, second_sim) = sims_sorted[1]
+
             cur_sim = sims.get(seg.speaker_id, -1.0)
             best_spk = max(sims, key=sims.get)
             best_sim = sims[best_spk]
 
             new_sid = seg.speaker_id
-            if best_spk != seg.speaker_id and (best_sim - cur_sim) >= margin:
+            delta_top2 = best_sim - second_sim
+            delta_cur = best_sim - cur_sim
+
+            if (
+                best_spk != seg.speaker_id
+                and best_sim >= min_best_sim
+                and delta_top2 >= top2_margin
+                and delta_cur >= margin
+            ):
                 new_sid = best_spk
                 changed += 1
+                if debug:
+                    print(
+                        f"   🔁 seg {seg.start_ms}-{seg.end_ms} "
+                        f"{seg.speaker_id}→{new_sid} "
+                        f"best={best_sim:.3f} second={second_sim:.3f} cur={cur_sim:.3f} "
+                        f"Δtop2={delta_top2:.3f} Δcur={delta_cur:.3f}"
+                    )
 
             out.append(SpeakerSegment(
                 speaker_id=new_sid,
