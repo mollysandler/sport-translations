@@ -31,7 +31,7 @@ load_dotenv()
 from diarizer import SpeakerDiarizer, SpeakerSegment
 from utils import estimate_pitch_yin, gender_from_pitch, TTSConfig, SpeakerMergeConfig
 
-def _get_hf_token_from_env() -> str | None:
+def _get_hf_token_from_env() -> Optional[str]:    
     return (
         os.getenv("HUGGING_FACE_TOKEN")
     )
@@ -65,8 +65,8 @@ class SmartVoiceManager:
     def __init__(
         self,
         use_voice_cloning: bool = False,
-        tts_config: TTSConfig | None = None,
-        speaker_merge: SpeakerMergeConfig | None = None,
+        tts_config: Optional[TTSConfig] = None,
+        speaker_merge: Optional[SpeakerMergeConfig] = None,
     ):
 
         # Configs (formerly env vars)
@@ -372,7 +372,7 @@ def _wav_bytes_from_audio_np(audio_np: np.ndarray, sample_rate: int) -> bytes:
     bio.seek(0)
     return bio.read()
 
-def _audio_np_from_wav_bytes(wav_bytes: bytes) -> tuple[np.ndarray, int]:
+def _audio_np_from_wav_bytes(wav_bytes: bytes) -> Tuple[np.ndarray, int]:
     """Decode WAV bytes into (float32 mono numpy, sample_rate)."""
     if not wav_bytes:
         return np.zeros(0, dtype=np.float32), 0
@@ -506,8 +506,8 @@ class DynamicSpeakerTranslator:
         buffer_duration_sec: int = 300,
         max_workers: int = 3,  # Reduced default to avoid ElevenLabs rate limits
         use_voice_cloning: bool = False,
-        tts_config: TTSConfig | None = None,
-        speaker_merge: SpeakerMergeConfig | None = None,
+        tts_config: Optional[TTSConfig] = None,
+        speaker_merge: Optional[SpeakerMergeConfig] = None,
     ):
         self.source_lang = source_lang
         self.target_lang = target_lang
@@ -1218,7 +1218,7 @@ class DynamicSpeakerTranslator:
                 self.error_occurred.set()
                 print(f"\n❌ Error: {e}")
 
-    def _tts_bytes_to_wav(self, audio_bytes: bytes, output_sr: int = 24000) -> tuple[bytes, int]:
+    def _tts_bytes_to_wav(self, audio_bytes: bytes, output_sr: int = 24000) -> Tuple[bytes, int]:
             """
             Convert arbitrary TTS bytes (often MP3 from ElevenLabs) into normalized WAV bytes.
             Returns (wav_bytes, duration_ms).
@@ -1288,7 +1288,7 @@ class DynamicSpeakerTranslator:
                 language=self.source_lang,
                 beam_size=5,
                 vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=250),
+                vad_parameters=Dict(min_silence_duration_ms=250),
                 condition_on_previous_text=False,
             )
 
@@ -1368,7 +1368,7 @@ class DynamicSpeakerTranslator:
                 out.export(bio, format="wav")
                 return bio.getvalue()
 
-            def _fit_tts_to_original(wav_bytes: bytes, tts_ms: int, orig_ms: int) -> tuple[bytes, int]:
+            def _fit_tts_to_original(wav_bytes: bytes, tts_ms: int, orig_ms: int) -> Tuple[bytes, int]:
                 """
                 Fit TTS audio into the diarized segment duration *without cutting words* when possible.
 
@@ -1711,7 +1711,7 @@ class DynamicSpeakerTranslator:
         #     self.playback_queue.task_done()
 
         with self.segments_lock:
-            segments = list(self.all_segments)
+            segments = List(self.all_segments)
 
         final_audio = self._compose_audio(segments, total_duration_sec)
 

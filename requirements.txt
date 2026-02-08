@@ -40,3 +40,11 @@ sentencepiece>=0.2.0
 elevenlabs==2.32.0
 qwen-tts==0.0.5
 coqui-tts==0.27.5
+
+# --- Web/API ---
+fastapi==0.128.3
+starlette==0.52.1
+httpx==0.28.1
+python-multipart==0.0.22
+# --- UI ---
+gradio==6.5.1
