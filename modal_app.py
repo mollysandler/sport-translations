@@ -33,6 +33,7 @@ secrets = [modal.Secret.from_name("sports-secrets")]
     memory=16384,
     timeout=60 * 60,
     secrets=secrets,
+    max_containers=1
 )
 @modal.asgi_app()
 def fastapi_app():

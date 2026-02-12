@@ -3,11 +3,11 @@ import base64
 import io
 import os
 import tempfile
+import traceback
 from typing import Optional
 
-
 import torchaudio
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydub import AudioSegment
 
@@ -71,44 +71,53 @@ def translate_audio(
     speaker_emb_min_chunk_ms: int = Form(250),
     speaker_merge_ref_sec: float = Form(20.0),
 ):
-    # 1) Save upload, normalize format
-    raw_path = _save_upload_to_temp(audio)
-    wav_path = _ensure_wav_16k_mono(raw_path)
+    try: 
+        import torch
+        print("CUDA available:", torch.cuda.is_available())
+        if torch.cuda.is_available():
+            print("GPU:", torch.cuda.get_device_name(0))
 
-    # 2) Build configs from "CLI-like" params
-    tts_cfg = TTSConfig(
-        tts_backend=tts_backend,
-        qwen_enable=bool(qwen_tts_enable),
-        qwen_model_id=qwen_tts_model_id,
-        qwen_device=qwen_tts_device,
-        xtts_enable=bool(xtts_enable),
-        xtts_model_id=xtts_model_id,
-        xtts_device=xtts_device,
-    )
+        # 1) Save upload, normalize format
+        raw_path = _save_upload_to_temp(audio)
+        wav_path = _ensure_wav_16k_mono(raw_path)
 
-    speaker_cfg = SpeakerMergeConfig(
-        merge_enable=bool(speaker_merge_enable),
-        merge_sim=speaker_merge_sim,
-        tiny_total_ms=speaker_tiny_total_ms,
-        emb_min_chunk_ms=speaker_emb_min_chunk_ms,
-        merge_ref_sec=float(speaker_merge_ref_sec),
-    )
+        # 2) Build configs from "CLI-like" params
+        tts_cfg = TTSConfig(
+            tts_backend=tts_backend,
+            qwen_enable=bool(qwen_tts_enable),
+            qwen_model_id=qwen_tts_model_id,
+            qwen_device=qwen_tts_device,
+            xtts_enable=bool(xtts_enable),
+            xtts_model_id=xtts_model_id,
+            xtts_device=xtts_device,
+        )
 
-    # 3) Run translation WITHOUT playback (important for servers)
-    translator = DynamicSpeakerTranslator(
-        source_lang=source_lang,
-        target_lang=target_lang,
-        buffer_duration_sec=buffer_duration_sec,
-        max_workers=max_workers,
-        use_voice_cloning=use_voice_cloning,
-        tts_config=tts_cfg,
-        speaker_merge=speaker_cfg,
-    )
+        speaker_cfg = SpeakerMergeConfig(
+            merge_enable=bool(speaker_merge_enable),
+            merge_sim=speaker_merge_sim,
+            tiny_total_ms=speaker_tiny_total_ms,
+            emb_min_chunk_ms=speaker_emb_min_chunk_ms,
+            merge_ref_sec=float(speaker_merge_ref_sec),
+        )
 
-    # --- key change: call a "no-playback" method ---
-    mp3_bytes, captions = translator.translate_audio_file_no_playback(wav_path)
+        # 3) Run translation WITHOUT playback (important for servers)
+        translator = DynamicSpeakerTranslator(
+            source_lang=source_lang,
+            target_lang=target_lang,
+            buffer_duration_sec=buffer_duration_sec,
+            max_workers=max_workers,
+            use_voice_cloning=use_voice_cloning,
+            tts_config=tts_cfg,
+            speaker_merge=speaker_cfg,
+        )
 
-    return {
-        "audio_base64": base64.b64encode(mp3_bytes).decode("utf-8"),
-        "captions": captions,
-    }
+        # --- key change: call a "no-playback" method ---
+        mp3_bytes, captions = translator.translate_audio_file_no_playback(wav_path)
+
+        return {
+            "audio_base64": base64.b64encode(mp3_bytes).decode("utf-8"),
+            "captions": captions,
+        }
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))

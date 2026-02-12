@@ -1714,7 +1714,7 @@ class DynamicSpeakerTranslator:
         #     self.playback_queue.task_done()
 
         with self.segments_lock:
-            segments = List(self.all_segments)
+            segments = list(self.all_segments)
 
         final_audio = self._compose_audio(segments, total_duration_sec)
 

@@ -23,10 +23,13 @@ export default function AudioInput({
     formData.append("target_lang", targetLanguage);
 
     try {
-      const response = await fetch("http://127.0.0.1:5000/translate-audio", {
-        method: "POST",
-        body: formData,
-      });
+      const response = await fetch(
+        "https://mollysandler--sports-translation-api-fastapi-app.modal.run/translate-audio",
+        {
+          method: "POST",
+          body: formData,
+        },
+      );
 
       if (!response.ok) {
         throw new Error("Network response was not ok");
