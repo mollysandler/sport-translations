@@ -26,7 +26,10 @@ import numpy as np
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
-load_dotenv()
+# Only load locally (optional)
+import os
+if os.path.exists(".env"):
+    load_dotenv(".env")
 
 from diarizer import SpeakerDiarizer, SpeakerSegment
 from utils import estimate_pitch_yin, gender_from_pitch, TTSConfig, SpeakerMergeConfig
