@@ -56,7 +56,12 @@ class SpeakerDiarizer:
                 token=hf_token,
             )
 
-        device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        # device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        device = torch.device(
+            "cuda" if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_available()
+            else "cpu"
+        )
         self.pipeline.to(device)
         print(f"   ✅ Diarization pipeline loaded on {device}")
         # Optional: speaker embedding model for post-merge consolidation

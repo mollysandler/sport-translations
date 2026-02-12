@@ -564,8 +564,8 @@ class DynamicSpeakerTranslator:
         model_size = "small.en" if self.source_lang == "en" else "small"
         self.whisper = WhisperModel(
             model_size,
-            device="cpu",
-            compute_type="int8",
+            device="cuda",
+            compute_type="float16",
             num_workers=2
         )
         print(f"   ✅ Using {model_size} model")

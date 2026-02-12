@@ -5,6 +5,7 @@ import os
 import tempfile
 from typing import Optional
 
+
 import torchaudio
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,7 +19,8 @@ app = FastAPI()
 # Allow your Vite dev server to call the API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+    # allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -58,10 +60,10 @@ def translate_audio(
     tts_backend: str = Form("qwen"),
     qwen_tts_enable: int = Form(1),
     qwen_tts_model_id: str = Form("Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
-    qwen_tts_device: str = Form("mps"),
+    qwen_tts_device: str = Form("cuda"),
     xtts_enable: int = Form(1),
     xtts_model_id: str = Form("tts_models/multilingual/multi-dataset/xtts_v2"),
-    xtts_device: str = Form("cpu"),
+    xtts_device: str = Form("cuda"),
 
     speaker_merge_enable: int = Form(1),
     speaker_merge_sim: float = Form(0.74),
