@@ -26,10 +26,9 @@ import numpy as np
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from diarizer import SportsDiarizer
-from dotenv import load_dotenv
-if os.getenv("MODAL_ENVIRONMENT") is None and os.path.exists(".env"):
-    load_dotenv(".env")
-
+from huggingface_hub import snapshot_download
+import shutil
+from qwen_tts import Qwen3TTSModel
 from diarizer import SpeakerSegment
 from utils import estimate_pitch_yin, gender_from_pitch, TTSConfig, SpeakerMergeConfig
 
@@ -37,6 +36,8 @@ def _get_hf_token_from_env() -> Optional[str]:
     return (
         os.getenv("HUGGING_FACE_TOKEN")
     )
+
+os.environ["COQUI_TOS_AGREED"] = "1"
 
 @dataclass
 class TranslationSegment:
@@ -395,13 +396,21 @@ class QwenLocalVoiceCloner:
         self.device = device
         self._qwen_synth_sem = threading.Semaphore(1)
 
-        try:
-            from qwen_tts import Qwen3TTSModel
-            # Qwen examples use device_map like 'cuda:0'. On macOS, 'cpu' is safest.
-            device_map = device
+        try: 
+            model_path = snapshot_download(repo_id=model_id)
+            tokenizer_path = os.path.join(model_path, "speech_tokenizer")
+            os.makedirs(tokenizer_path, exist_ok=True)
+
+            for fname in ["preprocessor_config.json", "config.json"]:
+                src = os.path.join(model_path, fname)
+                dst = os.path.join(tokenizer_path, fname)
+                if os.path.exists(src) and not os.path.exists(dst):
+                    shutil.copyfile(src, dst)
+
             self.model = Qwen3TTSModel.from_pretrained(
-                model_id,
-                device_map=device_map,
+                model_path,
+                device_map=device,
+                trust_remote_code=True,
             )
             self.available = True
         except Exception as e:
@@ -510,6 +519,8 @@ class DynamicSpeakerTranslator:
         use_voice_cloning: bool = False,
         tts_config: Optional[TTSConfig] = None,
         speaker_merge: Optional[SpeakerMergeConfig] = None,
+        qwen_cloner=None, 
+        xtts_cloner=None,
     ):
         self.source_lang = source_lang
         self.target_lang = target_lang
@@ -526,11 +537,14 @@ class DynamicSpeakerTranslator:
         self.speaker_ref_sec: Dict[str, float] = {}
         self.speaker_ref_text: Dict[str, str] = {}
         self.speaker_qwen_prompt: Dict[str, object] = {}
-        self.xtts_cloner = None
         # Lazy-load guards for heavy TTS backends
         self._tts_load_lock = threading.Lock()
-        self._qwen_load_attempted = False
-        self._xtts_load_attempted = False
+
+        self.qwen_cloner = qwen_cloner
+        self.xtts_cloner = xtts_cloner
+
+        self._qwen_load_attempted = qwen_cloner is not None
+        self._xtts_load_attempted = xtts_cloner is not None
         self._qwen_prompt_lock = threading.Lock()
 
         
@@ -616,10 +630,15 @@ class DynamicSpeakerTranslator:
 
         # 4/5. Local voice cloning backends (Qwen / XTTS)
         # These can take a long time to load, so we lazy-load them on first use.
-        self.qwen_cloner = None
-        self.xtts_cloner = None
-        self._qwen_load_attempted = False
-        self._xtts_load_attempted = False
+        if self.qwen_cloner is None:
+            self._qwen_load_attempted = False
+        else:
+            self._qwen_load_attempted = True
+
+        if self.xtts_cloner is None:
+            self._xtts_load_attempted = False
+        else:
+            self._xtts_load_attempted = True
 
         print(f"✅ All services ready | Parallel workers: {self.max_workers}\n")
     
@@ -628,11 +647,15 @@ class DynamicSpeakerTranslator:
     # Lazy-loaded local TTS backends
     # ----------------------------
     def _ensure_qwen_loaded(self) -> bool:
-        """Load Qwen local voice cloning backend on-demand."""
         if not self.tts_config.qwen_enable:
             return False
+
+        # If injected but unavailable, allow a retry via lazy-load once
         if getattr(self, "qwen_cloner", None) is not None:
-            return bool(self.qwen_cloner.available)
+            if bool(self.qwen_cloner.available):
+                return True
+            self.qwen_cloner = None  # allow lazy-load path to run
+
         with self._tts_load_lock:
             if getattr(self, "qwen_cloner", None) is not None:
                 return bool(self.qwen_cloner.available)
@@ -645,20 +668,23 @@ class DynamicSpeakerTranslator:
                     model_id=self.tts_config.qwen_model_id,
                     device=self.tts_config.qwen_device,
                 )
-                if self.qwen_cloner.available:
-                    print("   ✅ Qwen3-TTS ready (local)")
-                    return True
+                return bool(self.qwen_cloner.available)
             except Exception as e:
                 print(f"   ⚠️  Qwen lazy-load failed: {e}")
-            self.qwen_cloner = None
-            return False
+                self.qwen_cloner = None
+                return False
+
 
     def _ensure_xtts_loaded(self) -> bool:
         """Load XTTS local voice cloning backend on-demand."""
         if not self.tts_config.xtts_enable:
             return False
+        
+        # If injected but unavailable, allow a retry via lazy-load once
         if getattr(self, "xtts_cloner", None) is not None:
-            return bool(self.xtts_cloner.available)
+            if bool(self.xtts_cloner.available):
+                return True
+            self.xtts_cloner = None
         with self._tts_load_lock:
             if getattr(self, "xtts_cloner", None) is not None:
                 return bool(self.xtts_cloner.available)

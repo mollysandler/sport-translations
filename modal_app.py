@@ -1,7 +1,16 @@
 # modal_app.py
 import modal
+import os
+import tempfile
+import torch
+
+from utils import TTSConfig, SpeakerMergeConfig
+from main import QwenLocalVoiceCloner, XTTSLocalVoiceCloner, DynamicSpeakerTranslator
 
 app = modal.App("sports-translation-api")
+
+HF_CACHE = modal.Volume.from_name("sports-hf-cache", create_if_missing=True)
+TORCH_CACHE = modal.Volume.from_name("sports-torch-cache", create_if_missing=True)
 
 image = (
     modal.Image.from_registry(
@@ -9,14 +18,22 @@ image = (
         add_python="3.11",
     )
     .apt_install("ffmpeg", "sox", "libsndfile1")
+    .env({
+        "HF_HOME": "/cache/hf",
+        "TRANSFORMERS_CACHE": "/cache/hf",
+        "TORCH_HOME": "/cache/torch",
+        "TRANSLATION_BACKEND": os.getenv("TRANSLATION_BACKEND", "local"),
+        "COQUI_TOS_AGREED": "1",
+        "HF_HUB_DISABLE_XET": "1",
+        "USE_VOICE_CLONING": "0",
+
+    })
     .pip_install_from_requirements("requirements.txt")
     .pip_install_from_requirements("requirements_gpu.txt")
-    # Your codebase is copied into the container so imports like `from main import ...` work
     .add_local_dir(".", remote_path="/root", copy=True)
 )
 
 secrets = [modal.Secret.from_name("sports-secrets")]
-
 
 @app.cls(
     image=image,
@@ -25,50 +42,78 @@ secrets = [modal.Secret.from_name("sports-secrets")]
     memory=16384,
     timeout=60 * 60,
     secrets=secrets,
-    enable_memory_snapshot=True,
-    max_containers=1,  # cheapest / simplest; increase only if you need more throughput
+    max_containers=1,
+    volumes={"/cache/hf": HF_CACHE, "/cache/torch": TORCH_CACHE},
+    enable_memory_snapshot=True
 )
 class TranslatorService:
-    @modal.enter(snap=True)
+    @modal.enter()
     def load_models(self):
-        # GPU perf toggles (fine to keep)
-        import torch
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
 
-        # Cache translators by language pair so we don't rebuild each request.
+        self.use_voice_cloning = os.getenv("USE_VOICE_CLONING", "0") == "1"
+
         self._translator_cache = {}
 
-        # If these configs are static, build once and reuse.
-        from utils import TTSConfig, SpeakerMergeConfig
-        self._tts_config = TTSConfig(xtts_enable=False)
+        self._tts_config = TTSConfig(
+            qwen_enable=True,
+            qwen_device="cuda",
+            xtts_enable=True,
+            xtts_device="cuda",
+        )
         self._speaker_merge = SpeakerMergeConfig()
+
+        self._qwen = None
+        self._xtts = None
+
+        if self.use_voice_cloning:
+            self._qwen = QwenLocalVoiceCloner(model_id=self._tts_config.qwen_model_id, device="cuda")
+            self._xtts = XTTSLocalVoiceCloner(model_name=self._tts_config.xtts_model_id, device="cuda")
 
     def _get_translator(self, source_lang: str, target_lang: str):
         key = (source_lang, target_lang)
         if key in self._translator_cache:
             return self._translator_cache[key]
-
-        from main import DynamicSpeakerTranslator
+        
         translator = DynamicSpeakerTranslator(
             source_lang=source_lang,
             target_lang=target_lang,
-            use_voice_cloning=True,
+            use_voice_cloning=self.use_voice_cloning,
             max_workers=3,
             tts_config=self._tts_config,
             speaker_merge=self._speaker_merge,
+            qwen_cloner=self._qwen,
+            xtts_cloner=self._xtts,
         )
         self._translator_cache[key] = translator
         return translator
 
-    def translate_wav(self, wav_path: str, source_lang: str, target_lang: str):
+    def _translate_wav_bytes_impl(self, wav_bytes: bytes, source_lang: str, target_lang: str):
         translator = self._get_translator(source_lang, target_lang)
-        return translator.translate_audio_file_no_playback(wav_path)
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        try:
+            with open(path, "wb") as f:
+                f.write(wav_bytes)
+            return translator.translate_audio_file_no_playback(path)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    @modal.method()
+    def translate_wav_bytes(self, wav_bytes: bytes, source_lang: str, target_lang: str):
+        return self._translate_wav_bytes_impl(wav_bytes, source_lang, target_lang)
+
+    def translate_wav_bytes_local(self, wav_bytes: bytes, source_lang: str, target_lang: str):
+        return self._translate_wav_bytes_impl(wav_bytes, source_lang, target_lang)
 
     @modal.asgi_app()
     def fastapi_app(self):
-        # Important: this runs *inside* the Modal container.
         from api_server import make_app
-        return make_app(self)
+        api = make_app(self)
 
+        return api
