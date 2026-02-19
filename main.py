@@ -25,13 +25,12 @@ import torchaudio
 import numpy as np
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from diarizer import SportsDiarizer
 from dotenv import load_dotenv
-# Only load locally (optional)
-import os
-if os.path.exists(".env"):
+if os.getenv("MODAL_ENVIRONMENT") is None and os.path.exists(".env"):
     load_dotenv(".env")
 
-from diarizer import SpeakerDiarizer, SpeakerSegment
+from diarizer import SpeakerSegment
 from utils import estimate_pitch_yin, gender_from_pitch, TTSConfig, SpeakerMergeConfig
 
 def _get_hf_token_from_env() -> Optional[str]:    
@@ -611,6 +610,10 @@ class DynamicSpeakerTranslator:
         )
         print("   ✅ ElevenLabs ready")
 
+        print("   🔊 Loading speaker diarization pipeline (once)...")
+        self.diarizer = SportsDiarizer()
+        print("   ✅ Diarizer ready")
+
         # 4/5. Local voice cloning backends (Qwen / XTTS)
         # These can take a long time to load, so we lazy-load them on first use.
         self.qwen_cloner = None
@@ -986,10 +989,7 @@ class DynamicSpeakerTranslator:
             total_duration = audio.shape[1] / self.sample_rate
             print(f"🎙️  Running diarization on full {total_duration:.1f}s...")
             
-            hf_token = _get_hf_token_from_env()
-            diarizer = SpeakerDiarizer(hf_token, merge_config=self.speaker_merge)
-            self._last_diarizer = diarizer
-            raw_segments = diarizer.diarize(audio, self.sample_rate)
+            raw_segments = self.diarizer.diarize(audio, self.sample_rate)
 
             segments = self._make_exclusive_turns(
                 raw_segments,
@@ -1291,7 +1291,7 @@ class DynamicSpeakerTranslator:
                 language=self.source_lang,
                 beam_size=5,
                 vad_filter=True,
-                vad_parameters=Dict(min_silence_duration_ms=250),
+                vad_parameters={"min_silence_duration_ms": 250},
                 condition_on_previous_text=False,
             )
 
@@ -1683,6 +1683,15 @@ class DynamicSpeakerTranslator:
         - no playback thread
         - returns (mp3_bytes, captions_list)
         """
+        with self.segments_lock:
+            self.all_segments = []
+        while not self.playback_queue.empty():
+            self.playback_queue.get_nowait()
+            self.playback_queue.task_done()
+        self.processing_complete.clear()
+        self.error_occurred.clear()
+        self.error_message = None
+
         audio, sr = torchaudio.load(wav_path)
 
         if audio.shape[0] > 1:

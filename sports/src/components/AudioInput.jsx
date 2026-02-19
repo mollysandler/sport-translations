@@ -24,7 +24,7 @@ export default function AudioInput({
 
     try {
       const response = await fetch(
-        "https://mollysandler--sports-translation-api-fastapi-app.modal.run/translate-audio",
+        "https://mollysandler--sports-translation-api-translatorservice-f-6a7378.modal.run/translate-audio",
         {
           method: "POST",
           body: formData,

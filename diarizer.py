@@ -66,7 +66,8 @@ class SpeakerDiarizer:
         print(f"   ✅ Diarization pipeline loaded on {device}")
         # Optional: speaker embedding model for post-merge consolidation
         self._spkrec = None
-        self._spkrec_device = torch.device("cpu")
+        # self._spkrec_device = torch.device("cpu")
+        self._spkrec_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Speaker merge config (formerly env vars)
         self.merge_config = merge_config or SpeakerMergeConfig()
@@ -278,7 +279,7 @@ class SpeakerDiarizer:
                 return
 
             # Keep on CPU to avoid MPS headaches
-            self._spkrec_device = torch.device("cpu")
+            self._spkrec_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self._spkrec = EncoderClassifier.from_hparams(
                 source="speechbrain/spkrec-ecapa-voxceleb",
                 run_opts={"device": str(self._spkrec_device)},
@@ -482,3 +483,12 @@ class SpeakerDiarizer:
         # Optional: merge close segments again after relabel
         out = self._merge_close_segments(out)
         return out
+
+class SportsDiarizer(SpeakerDiarizer):
+    def __init__(self, hf_token: str | None = None, merge_config=None):
+        if hf_token is None:
+            hf_token = (
+                os.getenv("HUGGING_FACE_TOKEN")
+                or ""
+            )
+        super().__init__(hf_token, merge_config=merge_config)

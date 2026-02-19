@@ -10,12 +10,12 @@
 
 # --- Core numerical/audio ---
 numpy==1.26.4
-scipy==1.12.0
+scipy==1.13.0
 soundfile==0.12.1
 
 # --- PyTorch (pin torch + torchaudio to the SAME version to avoid ABI mismatch) ---
-torch==2.2.2
-torchaudio==2.2.2
+# torch==2.2.2
+# torchaudio==2.2.2
 
 # --- Utilities ---
 python-dotenv==1.0.1

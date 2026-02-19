@@ -60,7 +60,8 @@ class SpeakerDiarizer:
         print(f"   ✅ Diarization pipeline loaded on {device}")
         # Optional: speaker embedding model for post-merge consolidation
         self._spkrec = None
-        self._spkrec_device = torch.device("cpu")
+        self._spkrec_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
     def diarize(self, waveform: torch.Tensor, sample_rate: int = 16000) -> List[SpeakerSegment]:
         """
