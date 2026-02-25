@@ -1,4 +1,3 @@
-# dynamic_voice_optimizer.py
 """
 Smart voice matching system that:
 1. Handles unlimited number of speakers
@@ -18,7 +17,7 @@ import tempfile
 from scipy.io.wavfile import write as write_wav
 import torch
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Generator
 from pydub import AudioSegment
 from pydub.playback import play
 import torchaudio
@@ -1771,6 +1770,150 @@ class DynamicSpeakerTranslator:
         ]
 
         return mp3_bytes, captions
+    
+    def translate_audio_file_stream(
+        self,
+        wav_path: str,
+        buffer_duration_sec: float = 120.0,
+        heartbeat_sec: float = 2.0,
+    ) -> Generator[Dict, None, None]:
+        """
+        Streaming entrypoint:
+        - yields NDJSON-friendly dict events as segments become available
+        - keeps existing translate_audio_file_no_playback intact
+        Events:
+          {type:"start", total_duration_sec, buffer_duration_sec}
+          {type:"buffering", buffered_until_sec, buffered_segments, buffer_target_sec}
+          {type:"segment", caption:{...}}  (caption matches your frontend shape)
+          {type:"final", audio_base64, captions}
+          {type:"error", message}
+        """
+
+        # Reset state (same spirit as translate_audio_file_no_playback)
+        with self.segments_lock:
+            self.all_segments = []
+        while not self.playback_queue.empty():
+            try:
+                self.playback_queue.get_nowait()
+                self.playback_queue.task_done()
+            except Exception:
+                break
+        self.processing_complete.clear()
+        self.error_occurred.clear()
+        self.error_message = None
+
+        # Load / normalize audio
+        audio, sr = torchaudio.load(wav_path)
+        if audio.shape[0] > 1:
+            audio = torch.mean(audio, dim=0, keepdim=True)
+        if sr != self.sample_rate:
+            resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
+            audio = resampler(audio)
+
+        total_duration_sec = audio.shape[1] / self.sample_rate
+
+        # Diarize
+        speaker_segments = self._get_speaker_segments(audio, wav_path)
+
+        # Assign voices (same as non-stream path)
+        if self.use_voice_cloning:
+            self.speaker_voice_ids = self._create_speaker_voice_clones(
+                audio, speaker_segments, self.sample_rate
+            )
+        else:
+            self.speaker_voice_ids = self.voice_manager.assign_voices(
+                audio, speaker_segments, self.sample_rate
+            )
+
+        # Compute buffer target as "how much original timeline we want ready before playback"
+        buffer_target_ms = int(buffer_duration_sec * 1000)
+        buffered_until_ms = 0
+        buffered_segments = 0
+
+        yield {
+            "type": "start",
+            "total_duration_sec": total_duration_sec,
+            "buffer_duration_sec": buffer_duration_sec,
+            "segments_total": len(speaker_segments),
+        }
+
+        # Start processing in a background thread (so we can stream queue output)
+        t = threading.Thread(
+            target=self._process_segments_parallel,
+            args=(audio, speaker_segments),
+            daemon=True,
+        )
+        t.start()
+
+        captions_out = []
+        last_heartbeat = time.time()
+
+        # Stream segments as they become available in-order
+        while True:
+            # Error path
+            if self.error_occurred.is_set():
+                msg = self.error_message or "Unknown error"
+                yield {"type": "error", "message": msg}
+                return
+
+            try:
+                seg = self.playback_queue.get(timeout=0.5)
+                self.playback_queue.task_done()
+
+                # Update buffering progress based on ORIGINAL timeline end
+                buffered_segments += 1
+                buffered_until_ms = max(buffered_until_ms, int(seg.end_ms))
+
+                # Emit buffering status occasionally until buffer is reached
+                if buffered_until_ms < buffer_target_ms:
+                    yield {
+                        "type": "buffering",
+                        "buffered_until_sec": buffered_until_ms / 1000.0,
+                        "buffered_segments": buffered_segments,
+                        "buffer_target_sec": buffer_duration_sec,
+                    }
+
+                caption = {
+                    "speaker": seg.speaker_id,
+                    "startTime": seg.start_ms / 1000.0,
+                    "endTime": seg.end_ms / 1000.0,
+                    "original": seg.original_text,
+                    "translated": seg.translated_text,
+                }
+                captions_out.append(caption)
+
+                yield {"type": "segment", "caption": caption}
+
+            except queue.Empty:
+                # Heartbeat so the client/proxy doesn't think the connection died
+                now = time.time()
+                if now - last_heartbeat >= heartbeat_sec:
+                    yield {
+                        "type": "heartbeat",
+                        "processing_complete": self.processing_complete.is_set(),
+                        "buffered_until_sec": buffered_until_ms / 1000.0,
+                    }
+                    last_heartbeat = now
+
+                # Stop when processing is done and nothing left to emit
+                if self.processing_complete.is_set():
+                    break
+
+        # Build final MP3 (same as non-stream path)
+        with self.segments_lock:
+            segments = list(self.all_segments)
+
+        final_audio = self._compose_audio(segments, total_duration_sec)
+        mp3_io = io.BytesIO()
+        final_audio.export(mp3_io, format="mp3")
+        mp3_bytes = mp3_io.getvalue()
+
+        import base64
+        yield {
+            "type": "final",
+            "audio_base64": base64.b64encode(mp3_bytes).decode("utf-8"),
+            "captions": captions_out,
+        }
 
 
 

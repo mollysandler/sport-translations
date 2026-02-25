@@ -104,6 +104,21 @@ class TranslatorService:
             except OSError:
                 pass
 
+    def translate_wav_bytes_stream_local(self, wav_bytes: bytes, source_lang: str, target_lang: str, buffer_sec: float = 120.0):
+        translator = self._get_translator(source_lang, target_lang)
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        try:
+            with open(path, "wb") as f:
+                f.write(wav_bytes)
+            # This yields dict events
+            yield from translator.translate_audio_file_stream(path, buffer_duration_sec=buffer_sec)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass 
+
     @modal.method()
     def translate_wav_bytes(self, wav_bytes: bytes, source_lang: str, target_lang: str):
         return self._translate_wav_bytes_impl(wav_bytes, source_lang, target_lang)
