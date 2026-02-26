@@ -119,8 +119,7 @@ export default function AudioInput({
       console.error("Error translating audio:", error);
       alert("Failed to translate audio. See console for details.");
     } finally {
-      setBusy(false);
-      setTimeout(() => setStatus(""), 2000);
+      setIsLoading(false);
     }
   }
 

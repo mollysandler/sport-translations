@@ -2121,6 +2121,64 @@ class DynamicSpeakerTranslator:
         print(f"   🆕  Live chunk: pitch={avg_pitch:.0f}Hz → new voice {voice_id[:8]}... ({spk_id})")
         return voice_id
 
+    def _assign_live_speakers(
+        self,
+        audio: torch.Tensor,
+        speech_items: list,
+        sr: int,
+        session_state: dict,
+    ) -> list:
+        """
+        Per-segment pitch-based speaker identification with cross-chunk continuity.
+
+        For each Whisper segment, estimate pitch and match against session speakers
+        (within 30 Hz).  If no match, create a new session speaker with a fresh voice.
+
+        Returns a list of (speaker_id, voice_id) parallel to speech_items.
+        """
+        PITCH_MATCH_HZ = 30.0
+        results = []
+
+        for start_sec, end_sec, _ in speech_items:
+            start_s = int(start_sec * sr)
+            end_s = int(end_sec * sr)
+            seg_audio = audio[:, start_s:end_s]
+            dur = (end_s - start_s) / sr
+
+            avg_pitch, pitch_range, gender = 150.0, 20.0, "male"
+            if dur >= 0.3:
+                try:
+                    seg_np = seg_audio.squeeze().detach().cpu().numpy().astype(np.float32)
+                    try:
+                        seg_np = librosa.effects.preemphasis(seg_np)
+                    except Exception:
+                        pass
+                    avg_pitch, pitch_range = _estimate_pitch_safe(seg_np, sr)
+                    gender = gender_from_pitch(avg_pitch, pitch_range)
+                except Exception:
+                    pass
+
+            # Match to existing session speaker
+            best_spk, best_dist = None, float("inf")
+            for spk, spk_pitch in session_state["speaker_pitches"].items():
+                dist = abs(avg_pitch - spk_pitch)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_spk = spk
+
+            if best_spk and best_dist <= PITCH_MATCH_HZ:
+                print(f"   ♻️  [{start_sec:.1f}-{end_sec:.1f}s] pitch={avg_pitch:.0f}Hz → {best_spk} (Δ{best_dist:.0f}Hz)")
+                results.append((best_spk, session_state["speaker_voice_ids"][best_spk]))
+            else:
+                voice_id = self.voice_manager._match_best_voice(gender, avg_pitch, pitch_range)
+                spk_id = f"SPEAKER_{len(session_state['speaker_voice_ids']):02d}"
+                session_state["speaker_voice_ids"][spk_id] = voice_id
+                session_state["speaker_pitches"][spk_id] = avg_pitch
+                print(f"   🆕  [{start_sec:.1f}-{end_sec:.1f}s] pitch={avg_pitch:.0f}Hz → new {spk_id}")
+                results.append((spk_id, voice_id))
+
+        return results
+
     def translate_chunk_stream(
         self,
         wav_bytes: bytes,
@@ -2171,14 +2229,14 @@ class DynamicSpeakerTranslator:
 
         print(f"   ✅ Live chunk {chunk_duration_ms}ms: {len(speech_items)} Whisper segment(s)")
 
-        # ── Assign voice (pitch-based session continuity, no diarization) ─────
-        voice_id = self._get_live_voice_for_chunk(audio, speech_items, sr, session_state)
+        # ── Per-segment speaker assignment (pitch-based, cross-chunk continuity) ──
+        speaker_assignments = self._assign_live_speakers(audio, speech_items, sr, session_state)
 
         # ── Translate + TTS each segment in parallel ──────────────────────────
         total = len(speech_items)
         completed_count = 0
 
-        def _translate_and_tts(start_sec, end_sec, original_text):
+        def _translate_and_tts(start_sec, end_sec, original_text, voice_id):
             if not self.use_local_translation:
                 translated = self.translator.translate(original_text)
             else:
@@ -2196,25 +2254,33 @@ class DynamicSpeakerTranslator:
             return start_sec, end_sec, original_text, translated, mp3_bytes
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {
-                executor.submit(_translate_and_tts, start, end, text): i
-                for i, (start, end, text) in enumerate(speech_items)
-            }
+            future_to_speaker = {}
+            for (start, end, text), (speaker_id, voice_id) in zip(speech_items, speaker_assignments):
+                fut = executor.submit(_translate_and_tts, start, end, text, voice_id)
+                future_to_speaker[fut] = speaker_id
 
-            for future in as_completed(futures):
+            for future in as_completed(future_to_speaker):
                 completed_count += 1
+                speaker_id = future_to_speaker[future]
                 try:
                     start_sec, end_sec, original_text, translated_text, mp3_bytes = future.result()
                 except Exception as e:
                     print(f"   ⚠️  Live translate/TTS failed: {e}")
                     continue
 
+                # SPEAKER_00 → "Speaker 1", SPEAKER_01 → "Speaker 2", etc.
+                try:
+                    spk_num = int(speaker_id.split("_")[-1]) + 1
+                except (ValueError, IndexError):
+                    spk_num = 1
+                speaker_label = f"Speaker {spk_num}"
+
                 audio_b64 = base64.b64encode(mp3_bytes).decode("utf-8")
                 yield {
                     "type": "segment",
                     "audio_b64": audio_b64,
                     "caption": {
-                        "speaker": next(iter(session_state["speaker_voice_ids"].keys()), "SPEAKER_00"),
+                        "speaker": speaker_label,
                         "startTime": chunk_offset_ms / 1000.0 + start_sec,
                         "endTime": chunk_offset_ms / 1000.0 + end_sec,
                         "original": original_text,

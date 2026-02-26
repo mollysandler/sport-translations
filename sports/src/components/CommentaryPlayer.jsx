@@ -213,18 +213,18 @@ export default function CommentaryPlayer({
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
 
-  const isStreaming = !!audioInput?.isStreaming;
+  const isLive = audioInput.type === "live";
 
-  // Autoscroll to bottom on new captions while streaming
+  // Autoscroll to bottom on new captions while live
   useEffect(() => {
-    if (!isStreaming) return;
+    if (!isLive) return;
     const el = scrollRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-  }, [isStreaming, captions.length]);
+  }, [isLive, captions.length]);
 
   useEffect(() => {
-    if (isStreaming) return; // no audio events in streaming mode
+    if (isLive) return; // no audio events in live mode
 
     const audio = audioRef.current;
     if (!audio) return;
@@ -245,17 +245,17 @@ export default function CommentaryPlayer({
       audio.removeEventListener("timeupdate", handleTimeUpdate);
       audio.removeEventListener("loadedmetadata", handleLoadedMetadata);
     };
-  }, [isStreaming, onPlayingChange]);
+  }, [isLive, onPlayingChange]);
 
   const togglePlay = () => {
-    if (isStreaming) return;
+    if (isLive) return;
     const a = audioRef.current;
     if (!a) return;
     isPlaying ? a.pause() : a.play();
   };
 
   const handleProgressChange = (e) => {
-    if (isStreaming) return;
+    if (isLive) return;
     const a = audioRef.current;
     if (!a) return;
     a.currentTime = Number.parseFloat(e.target.value);
@@ -268,28 +268,20 @@ export default function CommentaryPlayer({
     return `${mins}:${secs.toString().padStart(2, "0")}`;
   };
 
-  const isLive = audioInput.type === "live";
-
-  // Live mode: show the last 5 received captions as they arrive.
-  // Batch mode: show captions that overlap the current playback position.
-  const activeCaptions = isLive
-    ? captions.slice(-5)
-    : captions.filter((c) => currentTime >= c.startTime && currentTime <= c.endTime);
-
   const getSpeakerColor = (speaker) => {
     const colors = ["#2563eb", "#dc2626", "#16a34a", "#d97706", "#9333ea"];
     const num = parseInt(String(speaker).replace(/\D/g, "") || "0", 10);
     return colors[num % colors.length];
   };
 
-  // When streaming: show ALL captions as they arrive
-  // When not streaming: show only those for current playback time
+  // Live mode: show all captions as they arrive
+  // Batch mode: show only those overlapping the current playback position
   const captionsToShow = useMemo(() => {
-    if (isStreaming) return captions;
+    if (isLive) return captions;
     return captions.filter(
       (c) => currentTime >= c.startTime && currentTime <= c.endTime,
     );
-  }, [isStreaming, captions, currentTime]);
+  }, [isLive, captions, currentTime]);
 
   return (
     <div className="player-card">
@@ -351,7 +343,7 @@ export default function CommentaryPlayer({
         <div
           className="commentary-box"
           ref={scrollRef}
-          style={isStreaming ? { maxHeight: 420, overflowY: "auto" } : {}}
+          style={isLive ? { maxHeight: 420, overflowY: "auto" } : {}}
         >
           {/* ORIGINAL COLUMN */}
           <div className="commentary-section">
@@ -371,7 +363,7 @@ export default function CommentaryPlayer({
                 ))
               ) : (
                 <p className="placeholder-text">
-                  {isStreaming
+                  {isLive
                     ? "Streaming translation…"
                     : "Waiting for commentary…"}
                 </p>
@@ -399,7 +391,7 @@ export default function CommentaryPlayer({
                 ))
               ) : (
                 <p className="placeholder-text">
-                  {isStreaming
+                  {isLive
                     ? "Streaming translation…"
                     : "Waiting for translation…"}
                 </p>
