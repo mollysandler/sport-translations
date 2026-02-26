@@ -1,352 +1,445 @@
-// AudioInput.jsx
-import React, { useEffect, useRef, useState } from "react";
+"use client";
 
-export default function AudioInput(props) {
-  const {
-    sourceLanguage,
-    targetLanguage,
-    onAudioSelected,
-    onError,
-    apiBaseUrl,
-  } = props;
+import { useState, useRef } from "react";
+import "./AudioInput.css";
 
-  const API_BASE = (
-    apiBaseUrl ||
-    "https://mollysandler--sports-translation-api-translatorservice-f-6a7378.modal.run"
-  ).replace(/\/$/, "");
+const BASE_URL =
+  "https://mollysandler--sports-translation-api-translatorservice-f-6a7378.modal.run";
 
-  const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState("");
-  const [recording, setRecording] = useState(false);
+const CHUNK_SECONDS = 8;
 
-  const mediaRecorderRef = useRef(null);
-  const recordedChunksRef = useRef([]);
+// ── WAV encoding helpers ──────────────────────────────────────────────────────
 
-  // Local inputs fallback if parent doesn’t pass languages
-  const [sourceLang, setSourceLang] = useState(sourceLanguage || "en");
-  const [targetLang, setTargetLang] = useState(targetLanguage || "hi");
-
-  useEffect(() => {
-    if (sourceLanguage) setSourceLang(sourceLanguage);
-  }, [sourceLanguage]);
-
-  useEffect(() => {
-    if (targetLanguage) setTargetLang(targetLanguage);
-  }, [targetLanguage]);
-
-  function emitError(err) {
-    console.error(err);
-    onError?.(err);
+function encodeWav(samples, sampleRate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const write = (off, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i));
+  };
+  write(0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  write(8, "WAVE");
+  write(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);   // PCM
+  view.setUint16(22, 1, true);   // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  write(36, "data");
+  view.setUint32(40, samples.length * 2, true);
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
   }
+  return buffer;
+}
 
-  function blobToObjectUrlFromBase64(base64, mimeType = "audio/mpeg") {
-    const byteChars = atob(base64);
-    const bytes = new Uint8Array(byteChars.length);
-    for (let i = 0; i < byteChars.length; i++)
-      bytes[i] = byteChars.charCodeAt(i);
-    const blob = new Blob([bytes], { type: mimeType });
-    return URL.createObjectURL(blob);
-  }
+// ── SSE line parser ───────────────────────────────────────────────────────────
 
-  async function streamTranslate(file, filename = "audio.wav") {
-    setBusy(true);
-    setStatus("Uploading & streaming…");
-
-    // Show streaming card immediately
-    onAudioSelected?.({
-      type: "file",
-      source: null,
-      name: `Streaming - ${filename}`,
-      timestamp: new Date(),
-      captions: [],
-      isStreaming: true,
-    });
-
-    try {
-      const form = new FormData();
-      form.append("audio", file, filename);
-      form.append("source_lang", sourceLang || "en");
-      form.append("target_lang", targetLang || "hi");
-      form.append("buffer_sec", "120");
-
-      const res = await fetch(`${API_BASE}/translate-audio-stream`, {
-        method: "POST",
-        body: form,
-      });
-
-      if (!res.ok || !res.body) {
-        const text = await res.text().catch(() => "");
-        throw new Error(
-          `Stream failed (${res.status}): ${text || res.statusText}`,
-        );
-      }
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder("utf-8");
-
-      let buffer = "";
-      let captionsAcc = [];
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          if (!line.trim()) continue;
-
-          let evt;
-          try {
-            evt = JSON.parse(line);
-          } catch {
-            continue;
-          }
-
-          if (evt.type === "buffering") {
-            setStatus(
-              `Buffering… ${Math.floor(evt.buffered_until_sec || 0)}s / ${Math.floor(
-                evt.buffer_target_sec || 120,
-              )}s`,
-            );
-          }
-
-          if (evt.type === "segment" && evt.caption) {
-            captionsAcc = [...captionsAcc, evt.caption];
-
-            // IMPORTANT: update parent on every segment
-            onAudioSelected?.({
-              type: "file",
-              source: null,
-              name: `Streaming - ${filename}`,
-              timestamp: new Date(),
-              captions: captionsAcc,
-              isStreaming: true,
-            });
-          }
-
-          if (evt.type === "final") {
-            const audioBase64 = evt.audio_base64;
-            const finalCaptions = evt.captions || captionsAcc;
-
-            const audioUrl = audioBase64
-              ? blobToObjectUrlFromBase64(audioBase64, "audio/mpeg")
-              : null;
-
-            setStatus("Done ✅");
-
-            onAudioSelected?.({
-              type: "file",
-              source: audioUrl, // CommentaryPlayer expects audioInput.source
-              name: filename,
-              timestamp: new Date(),
-              captions: finalCaptions,
-              isStreaming: false, // switch UI out of streaming mode
-            });
-          }
-
-          if (evt.type === "error") {
-            throw new Error(evt.message || "Unknown stream error");
-          }
+async function* readSseEvents(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop(); // keep incomplete last line
+    for (const line of lines) {
+      if (line.startsWith("data: ")) {
+        try {
+          yield JSON.parse(line.slice(6));
+        } catch (_) {
+          // skip malformed
         }
       }
+    }
+  }
+}
+
+// ── Component ─────────────────────────────────────────────────────────────────
+
+export default function AudioInput({
+  sourceLanguage,
+  targetLanguage,
+  onAudioSelected,
+  onLiveCaptionAdded,
+}) {
+  const [inputMethod, setInputMethod] = useState("upload");
+  const [streamUrl, setStreamUrl] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [liveStatus, setLiveStatus] = useState("idle"); // idle | streaming | stopping
+
+  const sessionIdRef = useRef(null);
+  const micStreamRef = useRef(null);
+  const audioCtxRef = useRef(null);       // playback AudioContext
+  const captureCtxRef = useRef(null);     // capture AudioContext
+  const processorRef = useRef(null);      // ScriptProcessorNode
+  const sourceNodeRef = useRef(null);     // MediaStreamSourceNode
+  const pcmBufferRef = useRef(new Float32Array(0));
+  const nativeSRRef = useRef(44100);
+  const audioQueueRef = useRef([]);
+  const isPlayingAudioRef = useRef(false);
+
+  // ── Batch file upload (unchanged) ──────────────────────────────────────────
+
+  const processAudioOnBackend = async (audioBlob, fileName) => {
+    setIsLoading(true);
+    const formData = new FormData();
+    formData.append("audio", audioBlob, fileName);
+    formData.append("source_lang", sourceLanguage);
+    formData.append("target_lang", targetLanguage);
+
+    try {
+      const response = await fetch(`${BASE_URL}/translate-audio`, {
+        method: "POST",
+        body: formData,
+      });
+      if (!response.ok) throw new Error("Network response was not ok");
+
+      const data = await response.json();
+      const binary = window.atob(data.audio_base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const audioBlobResponse = new Blob([bytes], { type: "audio/mp3" });
+      const translatedAudioUrl = URL.createObjectURL(audioBlobResponse);
+
+      onAudioSelected({
+        type: "file",
+        source: translatedAudioUrl,
+        name: `Translated - ${fileName}`,
+        timestamp: new Date(),
+        captions: data.captions,
+      });
+    } catch (error) {
+      console.error("Error translating audio:", error);
+      alert("Failed to translate audio. See console for details.");
     } finally {
       setBusy(false);
       setTimeout(() => setStatus(""), 2000);
     }
   }
 
-  async function onFilePicked(e) {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  const handleFileUpload = (e) => {
+    const file = e.target.files[0];
+    if (file) processAudioOnBackend(file, file.name);
+  };
 
-    if (!file.type.startsWith("audio/") && !file.type.startsWith("video/")) {
-      emitError(
-        new Error("Please upload an audio or video file (mp3/wav/mp4/etc)."),
+  const handleStreamUrlSubmit = (e) => {
+    e.preventDefault();
+    if (streamUrl.trim()) {
+      onAudioSelected({
+        type: "stream",
+        source: streamUrl,
+        name: "Live Stream",
+        timestamp: new Date(),
+      });
+      setStreamUrl("");
+    }
+  }
+
+  // ── Audio playback queue (Web Audio API) ───────────────────────────────────
+
+  const drainAudioQueue = async () => {
+    if (isPlayingAudioRef.current) return;
+    isPlayingAudioRef.current = true;
+    while (audioQueueRef.current.length > 0) {
+      const b64 = audioQueueRef.current.shift();
+      const ctx = audioCtxRef.current;
+      if (!ctx) break;
+      try {
+        const binary = atob(b64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const audioBuffer = await ctx.decodeAudioData(bytes.buffer.slice(0));
+        await new Promise((resolve) => {
+          const src = ctx.createBufferSource();
+          src.buffer = audioBuffer;
+          src.connect(ctx.destination);
+          src.onended = resolve;
+          src.start();
+        });
+      } catch (err) {
+        console.warn("Audio decode/play error:", err);
+      }
+    }
+    isPlayingAudioRef.current = false;
+  };
+
+  // ── Resample raw PCM → 16 kHz WAV and POST to /translate-live ─────────────
+  //
+  // Accepts a Float32Array captured at nativeSR.  Resamples via OfflineAudioContext
+  // (same approach as blobToWav16kMono, but without the WebM decode step that
+  // silently fails on header-less MediaRecorder fragments after the first chunk).
+
+  const sendPcmChunk = async (samples) => {
+    if (!sessionIdRef.current || samples.length < 100) return;
+    const nativeSR = nativeSRRef.current;
+
+    let wavBlob;
+    try {
+      const offlineCtx = new OfflineAudioContext(
+        1,
+        Math.ceil((samples.length * 16000) / nativeSR),
+        16000
       );
+      const buf = offlineCtx.createBuffer(1, samples.length, nativeSR);
+      buf.getChannelData(0).set(samples);
+      const srcNode = offlineCtx.createBufferSource();
+      srcNode.buffer = buf;
+      srcNode.connect(offlineCtx.destination);
+      srcNode.start();
+      const resampled = await offlineCtx.startRendering();
+      const pcm16k = resampled.getChannelData(0);
+      wavBlob = new Blob([encodeWav(pcm16k, 16000)], { type: "audio/wav" });
+    } catch (err) {
+      console.warn("PCM resample/encode failed:", err);
       return;
     }
 
+    const formData = new FormData();
+    formData.append("audio", wavBlob, "chunk.wav");
+    formData.append("session_id", sessionIdRef.current);
+    formData.append("source_lang", sourceLanguage);
+    formData.append("target_lang", targetLanguage);
+
+    let response;
     try {
-      await streamTranslate(file, file.name);
+      response = await fetch(`${BASE_URL}/translate-live`, {
+        method: "POST",
+        body: formData,
+      });
     } catch (err) {
-      setStatus("Error ❌");
-      emitError(err);
-      setBusy(false);
-    } finally {
-      e.target.value = "";
+      console.error("translate-live fetch error:", err);
+      return;
     }
-  }
 
-  async function startRecording() {
-    try {
-      setStatus("Requesting microphone…");
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      recordedChunksRef.current = [];
-
-      const preferredTypes = [
-        "audio/webm;codecs=opus",
-        "audio/webm",
-        "audio/ogg;codecs=opus",
-        "audio/ogg",
-      ];
-
-      let mimeType = "";
-      for (const t of preferredTypes) {
-        if (MediaRecorder.isTypeSupported(t)) {
-          mimeType = t;
-          break;
-        }
+    for await (const item of readSseEvents(response)) {
+      if (item.type === "segment") {
+        audioQueueRef.current.push(item.audio_b64);
+        drainAudioQueue();
+        if (onLiveCaptionAdded) onLiveCaptionAdded(item.caption);
+      } else if (item.type === "error") {
+        console.error("Live chunk error:", item.message);
       }
-
-      const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-
-      mr.ondataavailable = (evt) => {
-        if (evt.data && evt.data.size > 0)
-          recordedChunksRef.current.push(evt.data);
-      };
-
-      mr.onstart = () => {
-        setRecording(true);
-        setStatus("Recording…");
-      };
-
-      mr.onstop = async () => {
-        setRecording(false);
-        setStatus("Preparing upload…");
-        stream.getTracks().forEach((t) => t.stop());
-
-        const blob = new Blob(recordedChunksRef.current, {
-          type: mimeType || "audio/webm",
-        });
-
-        try {
-          const ext = (mimeType || "").includes("ogg") ? "ogg" : "webm";
-          await streamTranslate(blob, `recording.${ext}`);
-        } catch (err) {
-          setStatus("Error ❌");
-          emitError(err);
-          setBusy(false);
-        }
-      };
-
-      mediaRecorderRef.current = mr;
-      mr.start(1000);
-    } catch (err) {
-      setStatus("Mic error ❌");
-      emitError(err);
-      setBusy(false);
     }
-  }
+  };
 
-  function stopRecording() {
-    const mr = mediaRecorderRef.current;
-    if (!mr) return;
-    if (mr.state === "recording") mr.stop();
-  }
+  // ── Start / stop live ─────────────────────────────────────────────────────
+
+  const handleStartLive = async () => {
+    setLiveStatus("streaming");
+
+    // Session
+    const res = await fetch(`${BASE_URL}/session/start`, { method: "POST" });
+    const { session_id } = await res.json();
+    sessionIdRef.current = session_id;
+
+    // Playback AudioContext
+    audioCtxRef.current = new AudioContext();
+    audioQueueRef.current = [];
+    isPlayingAudioRef.current = false;
+
+    // Microphone
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    micStreamRef.current = stream;
+
+    // Signal to parent: live mode started
+    onAudioSelected({
+      type: "live",
+      source: null,
+      name: "Live Translation",
+      timestamp: new Date(),
+      captions: [],
+    });
+
+    // ── ScriptProcessor for raw PCM capture ──────────────────────────────────
+    // Unlike MediaRecorder, ScriptProcessor yields raw Float32 PCM on every
+    // callback.  Every chunk is independently encodable — no WebM header
+    // fragmentation that silently breaks decodeAudioData after the first blob.
+
+    const captureCtx = new AudioContext();
+    captureCtxRef.current = captureCtx;
+    const nativeSR = captureCtx.sampleRate;
+    nativeSRRef.current = nativeSR;
+    const CHUNK_SAMPLES = Math.ceil(CHUNK_SECONDS * nativeSR);
+
+    pcmBufferRef.current = new Float32Array(0);
+
+    const sourceNode = captureCtx.createMediaStreamSource(stream);
+    sourceNodeRef.current = sourceNode;
+
+    const processor = captureCtx.createScriptProcessor(4096, 1, 1);
+    processorRef.current = processor;
+
+    processor.onaudioprocess = (e) => {
+      const input = e.inputBuffer.getChannelData(0);
+      // Append incoming samples to rolling buffer
+      const prev = pcmBufferRef.current;
+      const next = new Float32Array(prev.length + input.length);
+      next.set(prev);
+      next.set(input, prev.length);
+      pcmBufferRef.current = next;
+
+      if (pcmBufferRef.current.length >= CHUNK_SAMPLES) {
+        const chunk = pcmBufferRef.current.slice(0, CHUNK_SAMPLES);
+        pcmBufferRef.current = pcmBufferRef.current.slice(CHUNK_SAMPLES);
+        sendPcmChunk(chunk);
+      }
+    };
+
+    sourceNode.connect(processor);
+    // Muted gain node required: Chrome only fires onaudioprocess when the graph
+    // is connected to a destination; gain=0 avoids mic-to-speaker feedback.
+    const muteGain = captureCtx.createGain();
+    muteGain.gain.value = 0;
+    processor.connect(muteGain);
+    muteGain.connect(captureCtx.destination);
+  };
+
+  const handleStopLive = async () => {
+    setLiveStatus("stopping");
+
+    // Flush any remaining buffered audio (> 1 second)
+    const remaining = pcmBufferRef.current;
+    if (remaining.length > nativeSRRef.current) {
+      sendPcmChunk(remaining);
+    }
+    pcmBufferRef.current = new Float32Array(0);
+
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+    if (sourceNodeRef.current) {
+      sourceNodeRef.current.disconnect();
+      sourceNodeRef.current = null;
+    }
+    if (captureCtxRef.current) {
+      await captureCtxRef.current.close().catch(() => {});
+      captureCtxRef.current = null;
+    }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach((t) => t.stop());
+      micStreamRef.current = null;
+    }
+    if (sessionIdRef.current) {
+      const fd = new FormData();
+      fd.append("session_id", sessionIdRef.current);
+      await fetch(`${BASE_URL}/session/end`, { method: "POST", body: fd }).catch(() => {});
+      sessionIdRef.current = null;
+    }
+    if (audioCtxRef.current) {
+      await audioCtxRef.current.close().catch(() => {});
+      audioCtxRef.current = null;
+    }
+
+    setLiveStatus("idle");
+  };
+
+  // ── Render ────────────────────────────────────────────────────────────────
 
   return (
-    <div style={{ border: "1px solid #e5e7eb", borderRadius: 12, padding: 16 }}>
-      <div
-        style={{
-          display: "flex",
-          gap: 12,
-          flexWrap: "wrap",
-          alignItems: "center",
-        }}
-      >
-        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <label style={{ fontSize: 12, opacity: 0.8 }}>Source</label>
-          <input
-            value={sourceLang}
-            onChange={(e) => setSourceLang(e.target.value)}
-            placeholder="en"
-            style={{
-              padding: "8px 10px",
-              borderRadius: 10,
-              border: "1px solid #d1d5db",
-            }}
-            disabled={busy || recording}
-          />
-        </div>
-
-        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <label style={{ fontSize: 12, opacity: 0.8 }}>Target</label>
-          <input
-            value={targetLang}
-            onChange={(e) => setTargetLang(e.target.value)}
-            placeholder="hi"
-            style={{
-              padding: "8px 10px",
-              borderRadius: 10,
-              border: "1px solid #d1d5db",
-            }}
-            disabled={busy || recording}
-          />
-        </div>
-
-        <div style={{ flex: 1 }} />
-
-        <div
-          style={{
-            display: "flex",
-            gap: 10,
-            alignItems: "center",
-            flexWrap: "wrap",
-          }}
-        >
-          <label
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 10,
-              padding: "8px 12px",
-              borderRadius: 10,
-              border: "1px solid #d1d5db",
-              cursor: busy || recording ? "not-allowed" : "pointer",
-              opacity: busy || recording ? 0.6 : 1,
-            }}
+    <div className="audio-input-card">
+      {isLoading && (
+        <div className="loading-overlay">Translating... Please wait.</div>
+      )}
+      <div className="audio-input-card">
+        <h2>Select Commentary Source</h2>
+        <div className="input-method-tabs">
+          <button
+            className={`tab-button ${inputMethod === "upload" ? "active" : ""}`}
+            onClick={() => setInputMethod("upload")}
           >
-            <input
-              type="file"
-              accept="audio/*,video/*"
-              onChange={onFilePicked}
-              disabled={busy || recording}
-              style={{ display: "none" }}
-            />
-            <span>Upload audio/video</span>
-          </label>
+            Upload File
+          </button>
+          <button
+            className={`tab-button ${inputMethod === "stream" ? "active" : ""}`}
+            onClick={() => setInputMethod("stream")}
+          >
+            Stream URL
+          </button>
+          <button
+            className={`tab-button ${inputMethod === "record" ? "active" : ""}`}
+            onClick={() => setInputMethod("record")}
+          >
+            Record Live
+          </button>
+        </div>
 
-          {!recording ? (
-            <button
-              onClick={startRecording}
-              disabled={busy}
-              style={{
-                padding: "8px 12px",
-                borderRadius: 10,
-                border: "1px solid #d1d5db",
-                background: "white",
-                cursor: busy ? "not-allowed" : "pointer",
-                opacity: busy ? 0.6 : 1,
-              }}
-            >
-              Record mic
-            </button>
-          ) : (
-            <button
-              onClick={stopRecording}
-              style={{
-                padding: "8px 12px",
-                borderRadius: 10,
-                border: "1px solid #d1d5db",
-                background: "white",
-                cursor: "pointer",
-              }}
-            >
-              Stop
-            </button>
+        <div className="input-method-content">
+          {inputMethod === "upload" && (
+            <div className="upload-section">
+              <label htmlFor="audio-file" className="file-input-label">
+                <span className="upload-icon">📤</span>
+                <span>Click to upload or drag and drop</span>
+                <span className="upload-hint">MP3, WAV, M4A (Max 500MB)</span>
+              </label>
+              <input
+                id="audio-file"
+                type="file"
+                accept="audio/*"
+                onChange={handleFileUpload}
+                className="file-input"
+              />
+            </div>
+          )}
+
+          {inputMethod === "stream" && (
+            <form onSubmit={handleStreamUrlSubmit} className="stream-form">
+              <div className="stream-input-group">
+                <input
+                  type="url"
+                  placeholder="Enter stream URL (e.g., https://example.com/stream.m3u8)"
+                  value={streamUrl}
+                  onChange={(e) => setStreamUrl(e.target.value)}
+                  className="stream-input"
+                />
+                <button type="submit" className="submit-button">
+                  Connect Stream
+                </button>
+              </div>
+              <p className="stream-hint">
+                Supports HLS, DASH, and direct audio streams
+              </p>
+            </form>
+          )}
+
+          {inputMethod === "record" && (
+            <div className="record-section">
+              {liveStatus === "streaming" ? (
+                <div className="recording-active">
+                  <div className="recording-indicator">
+                    <span className="recording-dot"></span>
+                    Live — translating every 8s...
+                  </div>
+                  <button
+                    onClick={handleStopLive}
+                    className="record-button stop"
+                  >
+                    Stop Live
+                  </button>
+                </div>
+              ) : liveStatus === "stopping" ? (
+                <div className="recording-active">
+                  <p>Stopping...</p>
+                </div>
+              ) : (
+                <button
+                  onClick={handleStartLive}
+                  className="record-button start"
+                >
+                  🎤 Start Live Translation
+                </button>
+              )}
+              <p className="record-hint">
+                Translates microphone audio in real-time, 8-second chunks
+              </p>
+            </div>
           )}
         </div>
       </div>

@@ -1,4 +1,6 @@
 # requirements_gpu.txt
+# Modal GPU container — overrides torch/numpy from requirements.txt
 --extra-index-url https://download.pytorch.org/whl/cu121
 torch==2.2.2
 torchaudio==2.2.2
+numpy<2

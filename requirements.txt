@@ -9,13 +9,14 @@
 # - ffmpeg (required by moviepy & pydub for mp3/m4a handling)
 
 # --- Core numerical/audio ---
-numpy==1.26.4
-scipy==1.13.0
+numpy>=1.26
+scipy>=1.13
 soundfile==0.12.1
 
 # --- PyTorch (pin torch + torchaudio to the SAME version to avoid ABI mismatch) ---
-# torch==2.2.2
-# torchaudio==2.2.2
+# Local/Mac versions — Modal GPU overrides these via requirements_gpu.txt
+torch>=2.2
+torchaudio>=2.2
 
 # --- Utilities ---
 python-dotenv==1.0.1
@@ -28,7 +29,7 @@ moviepy==2.2.1
 faster-whisper==1.2.1
 
 # --- Diarization ---
-pyannote.audio==3.1.1
+pyannote.audio==4.0.4
 huggingface-hub>=0.20,<1.0
 
 # --- Translation ---

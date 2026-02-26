@@ -44,16 +44,16 @@ class SpeakerDiarizer:
             login(token=hf_token)
 
         try:
-            # pyannote.audio 3.x expects use_auth_token
-            self.pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                use_auth_token=hf_token,
-            )
-        except TypeError:
-            # some older variants used token=
+            # pyannote.audio 4.x uses token=
             self.pipeline = Pipeline.from_pretrained(
                 "pyannote/speaker-diarization-3.1",
                 token=hf_token,
+            )
+        except TypeError:
+            # pyannote.audio 3.x used use_auth_token=
+            self.pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=hf_token,
             )
 
         # device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -97,11 +97,15 @@ class SpeakerDiarizer:
         )
                 
         # --- FIX FOR DIARIZE-OUTPUT WRAPPER ---
-        if hasattr(output, "annotation"):
+        # pyannote 4.x returns DiarizeOutput with .speaker_diarization
+        # pyannote 3.x returns Annotation directly (has .itertracks)
+        if hasattr(output, "speaker_diarization"):
+            diarization = output.speaker_diarization
+        elif hasattr(output, "annotation"):
             diarization = output.annotation
         else:
             diarization = output
-                
+
         segments = []
         for turn, _, speaker in diarization.itertracks(yield_label=True):
             segment = SpeakerSegment(

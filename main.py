@@ -15,6 +15,7 @@ import librosa
 import io
 import tempfile
 from scipy.io.wavfile import write as write_wav
+from scipy.signal import resample as scipy_resample
 import torch
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Generator
@@ -29,12 +30,43 @@ from huggingface_hub import snapshot_download
 import shutil
 from qwen_tts import Qwen3TTSModel
 from diarizer import SpeakerSegment
-from utils import estimate_pitch_yin, gender_from_pitch, TTSConfig, SpeakerMergeConfig
+from utils import gender_from_pitch, TTSConfig, SpeakerMergeConfig
 
-def _get_hf_token_from_env() -> Optional[str]:    
+def _get_hf_token_from_env() -> Optional[str]:
     return (
         os.getenv("HUGGING_FACE_TOKEN")
     )
+
+
+def _estimate_pitch_safe(y: np.ndarray, sr: int) -> "Tuple[float, float]":
+    """
+    Pure-numpy autocorrelation pitch estimator.
+    No numba, no librosa.yin — safe in all container environments.
+    Returns (median_pitch_hz, pitch_range_hz).
+    """
+    fmin, fmax = 70.0, 300.0
+    min_lag = max(1, int(sr / fmax))
+    max_lag = min(len(y) - 1, int(sr / fmin))
+    frame_len = min(int(sr * 0.025), len(y))   # 25 ms frames
+    hop_len = max(1, int(sr * 0.010))           # 10 ms hop
+    pitches = []
+    for start in range(0, max(1, len(y) - frame_len + 1), hop_len):
+        frame = y[start: start + frame_len]
+        if np.max(np.abs(frame)) < 1e-4:        # skip silence
+            continue
+        corr = np.correlate(frame, frame, mode="full")
+        corr = corr[len(corr) // 2:]            # positive lags
+        if max_lag >= len(corr):
+            continue
+        seg = corr[min_lag: max_lag + 1]
+        if len(seg) == 0 or seg.max() <= 0:
+            continue
+        peak_lag = int(np.argmax(seg)) + min_lag
+        pitches.append(float(sr) / peak_lag)
+    if not pitches:
+        return 150.0, 20.0
+    arr = np.array(pitches, dtype=np.float32)
+    return float(np.median(arr)), float(np.std(arr))
 
 os.environ["COQUI_TOS_AGREED"] = "1"
 
@@ -161,21 +193,8 @@ class SmartVoiceManager:
         except Exception:
             pass
 
-        # 1) Pitch estimate (choose ONE)
-        # Fast:
-        avg_pitch = estimate_pitch_yin(audio_np, sample_rate)
-
-        # Or more stable (slower): pYIN
-        # avg_pitch = estimate_pitch_pyin(audio_np, sample_rate)
-
-        if avg_pitch is None:
-            avg_pitch = 150.0
-            pitch_range = 20.0
-        else:
-            # compute a pitch range robustly too
-            f0 = librosa.yin(audio_np, fmin=70, fmax=300, sr=sample_rate)
-            f0 = f0[np.isfinite(f0)]
-            pitch_range = float(np.std(f0)) if len(f0) else 20.0
+        # Pitch estimate — pure numpy, no numba
+        avg_pitch, pitch_range = _estimate_pitch_safe(audio_np, sample_rate)
 
         # 2) Gender (use your helper with an “unknown” band)
         gender = gender_from_pitch(avg_pitch, pitch_range)
@@ -304,19 +323,16 @@ class SmartVoiceManager:
             if collected_audio:
                 # Combine audio samples
                 combined = torch.cat(collected_audio, dim=1)
-                
+
                 # Limit to target duration
                 max_samples = int(target_duration * sample_rate)
                 if combined.shape[1] > max_samples:
                     combined = combined[:, :max_samples]
-                
-                # Analyze and assign voice
-                profile = self.analyze_speaker_characteristics(
-                    combined, 
-                    speaker_id, 
-                    sample_rate
-                )
-                
+
+                # Run pitch analysis in a subprocess so a librosa SIGSEGV
+                # (known to occur with numba/llvmlite in GPU containers)
+                # doesn't kill the main process — we fall back to defaults.
+                profile = self._analyze_speaker_safe(combined, speaker_id, sample_rate)
                 self.assigned_voices[speaker_id] = profile
             else:
                 # Fallback: assign random voice
@@ -341,7 +357,35 @@ class SmartVoiceManager:
         
         return {sid: profile.voice_id for sid, profile in self.assigned_voices.items()}
 
+    def _analyze_speaker_safe(self, audio_tensor, speaker_id: str, sample_rate: int) -> "VoiceProfile":
+        """
+        Inline pitch analysis using a pure-numpy autocorrelation estimator.
+        No numba / librosa.yin — safe in GPU containers where numba can SIGSEGV.
+        """
+        audio_np = audio_tensor.squeeze().detach().cpu().numpy().astype(np.float32)
+        try:
+            try:
+                audio_np = librosa.effects.preemphasis(audio_np)  # pure numpy FIR, safe
+            except Exception:
+                pass
+            avg_pitch, pitch_range = _estimate_pitch_safe(audio_np, sample_rate)
+            gender = gender_from_pitch(avg_pitch, pitch_range)
+            energy = np.abs(audio_np)
+            speaking_rate = float(np.sum(energy > 0.01)) / max(len(energy), 1) * 2.0
+        except Exception as e:
+            print(f"   ⚠️  {speaker_id}: pitch analysis failed ({e}), using defaults")
+            avg_pitch, pitch_range, gender, speaking_rate = 150.0, 20.0, "male", 2.0
 
+        print(f"   🔍 {speaker_id}: gender={gender} pitch={avg_pitch:.0f}Hz")
+        voice_id = self._match_best_voice(gender, avg_pitch, pitch_range)
+        return VoiceProfile(
+            speaker_id=speaker_id,
+            gender=gender,
+            avg_pitch=avg_pitch,
+            pitch_range=pitch_range,
+            speaking_rate=speaking_rate,
+            voice_id=voice_id,
+        )
 
 
 # === Voice cloning backends ===
@@ -576,7 +620,7 @@ class DynamicSpeakerTranslator:
         print("   📝 Loading Faster-Whisper...")
         from faster_whisper import WhisperModel
         
-        model_size = "small.en" if self.source_lang == "en" else "small"
+        model_size = "large-v3"
         self.whisper = WhisperModel(
             model_size,
             device="cuda",
@@ -623,9 +667,10 @@ class DynamicSpeakerTranslator:
         )
         print("   ✅ ElevenLabs ready")
 
-        print("   🔊 Loading speaker diarization pipeline (once)...")
-        self.diarizer = SportsDiarizer()
-        print("   ✅ Diarizer ready")
+        # Diarizer is lazy-loaded on first batch request (_ensure_diarizer).
+        # Keeping it out of __init__ lets the Modal memory snapshot complete cleanly
+        # and avoids the intermittent pyannote SIGSEGV on GPU container startup.
+        self.diarizer = None
 
         # 4/5. Local voice cloning backends (Qwen / XTTS)
         # These can take a long time to load, so we lazy-load them on first use.
@@ -643,8 +688,21 @@ class DynamicSpeakerTranslator:
     
 
     # ----------------------------
-    # Lazy-loaded local TTS backends
+    # Lazy-loaded backends
     # ----------------------------
+    def _ensure_diarizer(self):
+        """Load pyannote diarizer on first use (batch mode only).
+        Kept out of _initialize_services so the Modal memory snapshot completes
+        before pyannote has a chance to SIGSEGV on GPU container startup."""
+        if self.diarizer is not None:
+            return
+        print("   🔊 Loading speaker diarization pipeline (lazy)...")
+        self.diarizer = SportsDiarizer()
+        print("   ✅ Diarizer ready")
+        # pyannote disables TF32 as a side-effect; re-enable for Whisper perf.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     def _ensure_qwen_loaded(self) -> bool:
         if not self.tts_config.qwen_enable:
             return False
@@ -1011,6 +1069,7 @@ class DynamicSpeakerTranslator:
             self, audio: torch.Tensor, audio_path: str
         ) -> List[SpeakerSegment]:
             """Get speaker segments and remove overlaps"""
+            self._ensure_diarizer()
             total_duration = audio.shape[1] / self.sample_rate
             print(f"🎙️  Running diarization on full {total_duration:.1f}s...")
             
@@ -1314,7 +1373,7 @@ class DynamicSpeakerTranslator:
             segments_whisper, _ = self.whisper.transcribe(
                 audio_np,
                 language=self.source_lang,
-                beam_size=5,
+                beam_size=1,
                 vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 250},
                 condition_on_previous_text=False,
@@ -1458,8 +1517,9 @@ class DynamicSpeakerTranslator:
 
                     # If even max speed-up still leaves it too long, we’ll stretch then truncate tail lightly.
                     try:
-                        # librosa expects float32 [-1, 1] generally; your audio is already float32
-                        y2 = librosa.effects.time_stretch(y, rate=rate)
+                        # scipy FFT-based resample — no numba, safe in GPU containers
+                        n_target = max(1, int(round(len(y) / rate)))
+                        y2 = scipy_resample(y, n_target).astype(np.float32)
 
                         # Convert back to WAV bytes at same SR
                         wav2 = _wav_bytes_from_audio_np(y2, sr)
@@ -1598,7 +1658,7 @@ class DynamicSpeakerTranslator:
                 audio_generator = self.elevenlabs.text_to_speech.convert(
                     voice_id=voice_id,
                     text=translated_text,
-                    model_id="eleven_multilingual_v2",
+                    model_id="eleven_flash_v2_5",
                     voice_settings=self.voice_settings,
                 )
                 eleven_bytes = b"".join(audio_generator)
@@ -1915,6 +1975,255 @@ class DynamicSpeakerTranslator:
             "captions": captions_out,
         }
 
+    def _assign_chunk_voices(
+        self,
+        audio: torch.Tensor,
+        segments: List[SpeakerSegment],
+        sr: int,
+        session_state: dict,
+    ) -> Dict[str, str]:
+        """
+        Assign (or reuse from session) voice IDs for speakers in this chunk.
+
+        Cross-chunk continuity: match detected speakers to session speakers by pitch
+        proximity. If within 30 Hz → reuse that session speaker's voice.
+        Otherwise assign a fresh voice via voice_manager._match_best_voice.
+
+        Mutates session_state["speaker_voice_ids"] and session_state["speaker_pitches"].
+        Returns {chunk_local_speaker_id: voice_id}.
+        """
+        PITCH_MATCH_HZ = 30.0
+        unique_speakers = sorted(set(seg.speaker_id for seg in segments))
+        chunk_voice_map: Dict[str, str] = {}
+
+        for speaker_id in unique_speakers:
+            speaker_segs = [s for s in segments if s.speaker_id == speaker_id]
+
+            # Collect ≥0.5s of audio for pitch analysis
+            collected = []
+            total_dur = 0.0
+            for seg in speaker_segs:
+                start_sample = int(seg.start_sec * sr)
+                end_sample = int(seg.end_sec * sr)
+                seg_audio = audio[:, start_sample:end_sample]
+                seg_dur = (end_sample - start_sample) / sr
+                if seg_dur >= 0.1:
+                    collected.append(seg_audio)
+                    total_dur += seg_dur
+                if total_dur >= 5.0:
+                    break
+
+            if not collected or total_dur < 0.5:
+                # Not enough audio — reuse any existing session voice or default
+                if session_state["speaker_voice_ids"]:
+                    fallback = next(iter(session_state["speaker_voice_ids"].values()))
+                else:
+                    fallback = self.voice_manager._match_best_voice("male", 150.0, 20.0)
+                chunk_voice_map[speaker_id] = fallback
+                continue
+
+            combined = torch.cat(collected, dim=1)
+            audio_np = combined.squeeze().detach().cpu().numpy().astype(np.float32)
+
+            try:
+                try:
+                    audio_np = librosa.effects.preemphasis(audio_np)
+                except Exception:
+                    pass
+                avg_pitch, pitch_range = _estimate_pitch_safe(audio_np, sr)
+                gender = gender_from_pitch(avg_pitch, pitch_range)
+            except Exception:
+                avg_pitch, pitch_range, gender = 150.0, 20.0, "male"
+
+            # Try to match to an existing session speaker by pitch
+            session_pitches = session_state["speaker_pitches"]
+            best_session_spk = None
+            best_dist = float("inf")
+            for session_spk, session_pitch in session_pitches.items():
+                dist = abs(avg_pitch - session_pitch)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_session_spk = session_spk
+
+            if best_session_spk is not None and best_dist <= PITCH_MATCH_HZ:
+                voice_id = session_state["speaker_voice_ids"][best_session_spk]
+                print(f"   ♻️  {speaker_id}: pitch={avg_pitch:.0f}Hz → reusing {best_session_spk} voice (dist={best_dist:.0f}Hz)")
+            else:
+                voice_id = self.voice_manager._match_best_voice(gender, avg_pitch, pitch_range)
+                # Register as a new session speaker
+                session_state["speaker_voice_ids"][speaker_id] = voice_id
+                session_state["speaker_pitches"][speaker_id] = avg_pitch
+                print(f"   🆕  {speaker_id}: pitch={avg_pitch:.0f}Hz → new voice {voice_id[:8]}...")
+
+            chunk_voice_map[speaker_id] = voice_id
+
+        return chunk_voice_map
+
+    def _get_live_voice_for_chunk(
+        self,
+        audio: torch.Tensor,
+        speech_items: list,
+        sr: int,
+        session_state: dict,
+    ) -> str:
+        """
+        Estimate dominant pitch of this chunk, match to (or assign) a session voice.
+        Uses pitch proximity within 30 Hz to identify returning speakers.
+        """
+        collected = []
+        total_dur = 0.0
+        for start_sec, end_sec, _ in speech_items:
+            start_s = int(start_sec * sr)
+            end_s = int(end_sec * sr)
+            chunk = audio[:, start_s:end_s]
+            dur = (end_s - start_s) / sr
+            if dur > 0.1:
+                collected.append(chunk)
+                total_dur += dur
+            if total_dur >= 3.0:
+                break
+
+        if not collected or total_dur < 0.5:
+            if session_state["speaker_voice_ids"]:
+                return next(iter(session_state["speaker_voice_ids"].values()))
+            return self.voice_manager._match_best_voice("male", 150.0, 20.0)
+
+        combined = torch.cat(collected, dim=1)
+        audio_np = combined.squeeze().detach().cpu().numpy().astype(np.float32)
+
+        try:
+            try:
+                audio_np = librosa.effects.preemphasis(audio_np)
+            except Exception:
+                pass
+            avg_pitch, pitch_range = _estimate_pitch_safe(audio_np, sr)
+            gender = gender_from_pitch(avg_pitch, pitch_range)
+        except Exception:
+            avg_pitch, pitch_range, gender = 150.0, 20.0, "male"
+
+        PITCH_MATCH_HZ = 30.0
+        best_spk = None
+        best_dist = float("inf")
+        for spk, spk_pitch in session_state["speaker_pitches"].items():
+            dist = abs(avg_pitch - spk_pitch)
+            if dist < best_dist:
+                best_dist = dist
+                best_spk = spk
+
+        if best_spk and best_dist <= PITCH_MATCH_HZ:
+            print(f"   ♻️  Live chunk: pitch={avg_pitch:.0f}Hz → reusing {best_spk} (dist={best_dist:.0f}Hz)")
+            return session_state["speaker_voice_ids"][best_spk]
+
+        voice_id = self.voice_manager._match_best_voice(gender, avg_pitch, pitch_range)
+        spk_id = f"SPEAKER_{len(session_state['speaker_voice_ids']):02d}"
+        session_state["speaker_voice_ids"][spk_id] = voice_id
+        session_state["speaker_pitches"][spk_id] = avg_pitch
+        print(f"   🆕  Live chunk: pitch={avg_pitch:.0f}Hz → new voice {voice_id[:8]}... ({spk_id})")
+        return voice_id
+
+    def translate_chunk_stream(
+        self,
+        wav_bytes: bytes,
+        session_state: dict,
+    ):
+        """
+        Fast live-streaming path: uses Whisper's built-in VAD directly.
+
+        Skips the pyannote diarization pipeline entirely (~3-5x faster for short chunks).
+        Whisper timestamps feed directly into translate+TTS — no double-transcription.
+
+        Yields {"type": "segment", "audio_b64", "caption", "progress"} per segment.
+        """
+        import base64
+
+        # Load and normalise
+        audio, sr = torchaudio.load(io.BytesIO(wav_bytes))
+        if audio.shape[0] > 1:
+            audio = torch.mean(audio, dim=0, keepdim=True)
+        if sr != self.sample_rate:
+            audio = torchaudio.functional.resample(audio, sr, self.sample_rate)
+            sr = self.sample_rate
+
+        chunk_duration_ms = int(audio.shape[1] / sr * 1000)
+        chunk_offset_ms = session_state.get("chunk_offset_ms", 0)
+        audio_np = audio.squeeze().numpy()
+
+        # ── Transcribe with Whisper VAD (single pass, no pyannote) ────────────
+        raw_segs, _ = self.whisper.transcribe(
+            audio_np,
+            language=self.source_lang,
+            beam_size=1,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 300, "min_speech_duration_ms": 400},
+            condition_on_previous_text=False,
+        )
+
+        speech_items = [
+            (seg.start, seg.end, seg.text.strip())
+            for seg in raw_segs
+            if seg.text and seg.text.strip() and (seg.end - seg.start) >= 0.3
+        ]
+
+        if not speech_items:
+            print(f"   ℹ️  Live chunk {chunk_duration_ms}ms: no speech detected by Whisper VAD")
+            session_state["chunk_offset_ms"] = chunk_offset_ms + chunk_duration_ms
+            return
+
+        print(f"   ✅ Live chunk {chunk_duration_ms}ms: {len(speech_items)} Whisper segment(s)")
+
+        # ── Assign voice (pitch-based session continuity, no diarization) ─────
+        voice_id = self._get_live_voice_for_chunk(audio, speech_items, sr, session_state)
+
+        # ── Translate + TTS each segment in parallel ──────────────────────────
+        total = len(speech_items)
+        completed_count = 0
+
+        def _translate_and_tts(start_sec, end_sec, original_text):
+            if not self.use_local_translation:
+                translated = self.translator.translate(original_text)
+            else:
+                tokens = self.tokenizer([original_text], return_tensors="pt", padding=True)
+                out = self.translation_model.generate(**tokens)
+                translated = self.tokenizer.decode(out[0], skip_special_tokens=True)
+
+            gen = self.elevenlabs.text_to_speech.convert(
+                voice_id=voice_id,
+                text=translated,
+                model_id="eleven_flash_v2_5",
+                voice_settings=self.voice_settings,
+            )
+            mp3_bytes = b"".join(gen)
+            return start_sec, end_sec, original_text, translated, mp3_bytes
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {
+                executor.submit(_translate_and_tts, start, end, text): i
+                for i, (start, end, text) in enumerate(speech_items)
+            }
+
+            for future in as_completed(futures):
+                completed_count += 1
+                try:
+                    start_sec, end_sec, original_text, translated_text, mp3_bytes = future.result()
+                except Exception as e:
+                    print(f"   ⚠️  Live translate/TTS failed: {e}")
+                    continue
+
+                audio_b64 = base64.b64encode(mp3_bytes).decode("utf-8")
+                yield {
+                    "type": "segment",
+                    "audio_b64": audio_b64,
+                    "caption": {
+                        "speaker": next(iter(session_state["speaker_voice_ids"].keys()), "SPEAKER_00"),
+                        "startTime": chunk_offset_ms / 1000.0 + start_sec,
+                        "endTime": chunk_offset_ms / 1000.0 + end_sec,
+                        "original": original_text,
+                        "translated": translated_text,
+                    },
+                    "progress": {"completed": completed_count, "total": total},
+                }
+
+        session_state["chunk_offset_ms"] = chunk_offset_ms + chunk_duration_ms
 
 
 def _build_arg_parser():

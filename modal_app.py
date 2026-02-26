@@ -56,6 +56,7 @@ class TranslatorService:
         self.use_voice_cloning = os.getenv("USE_VOICE_CLONING", "0") == "1"
 
         self._translator_cache = {}
+        self._sessions: dict = {}
 
         self._tts_config = TTSConfig(
             qwen_enable=True,
@@ -125,6 +126,23 @@ class TranslatorService:
 
     def translate_wav_bytes_local(self, wav_bytes: bytes, source_lang: str, target_lang: str):
         return self._translate_wav_bytes_impl(wav_bytes, source_lang, target_lang)
+
+    def create_session(self) -> str:
+        import uuid
+        sid = str(uuid.uuid4())
+        self._sessions[sid] = {"speaker_voice_ids": {}, "speaker_pitches": {}, "chunk_offset_ms": 0}
+        return sid
+
+    def delete_session(self, session_id: str):
+        self._sessions.pop(session_id, None)
+
+    def process_live_chunk(self, wav_bytes: bytes, session_id: str, source_lang: str, target_lang: str):
+        session = self._sessions.get(session_id)
+        if session is None:
+            session = {"speaker_voice_ids": {}, "speaker_pitches": {}, "chunk_offset_ms": 0}
+            self._sessions[session_id or "default"] = session
+        translator = self._get_translator(source_lang, target_lang)
+        yield from translator.translate_chunk_stream(wav_bytes, session)
 
     @modal.asgi_app()
     def fastapi_app(self):

@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-import librosa
 
 
 # -------------------------
@@ -13,13 +12,33 @@ import librosa
 
 
 def estimate_pitch_yin(y: np.ndarray, sr: int) -> Optional[float]:
-    """Robust-ish median F0 estimate using librosa.yin."""
+    """
+    Median F0 estimate via autocorrelation (pure numpy — no numba/librosa.yin).
+    Safe in GPU containers where numba can SIGSEGV.
+    """
     y = y.astype(np.float32)
-    f0 = librosa.yin(y, fmin=70, fmax=300, sr=sr)  # speech range
-    f0 = f0[np.isfinite(f0)]
-    if len(f0) == 0:
+    fmin, fmax = 70.0, 300.0
+    min_lag = max(1, int(sr / fmax))
+    max_lag = min(len(y) - 1, int(sr / fmin))
+    frame_len = min(int(sr * 0.025), len(y))
+    hop_len = max(1, int(sr * 0.010))
+    pitches = []
+    for start in range(0, max(1, len(y) - frame_len + 1), hop_len):
+        frame = y[start: start + frame_len]
+        if np.max(np.abs(frame)) < 1e-4:
+            continue
+        corr = np.correlate(frame, frame, mode="full")
+        corr = corr[len(corr) // 2:]
+        if max_lag >= len(corr):
+            continue
+        seg = corr[min_lag: max_lag + 1]
+        if len(seg) == 0 or seg.max() <= 0:
+            continue
+        peak_lag = int(np.argmax(seg)) + min_lag
+        pitches.append(float(sr) / peak_lag)
+    if not pitches:
         return None
-    return float(np.median(f0))
+    return float(np.median(pitches))
 
 
 def gender_from_pitch(pitch_hz: Optional[float], pitch_range_hz: Optional[float] = None) -> str:

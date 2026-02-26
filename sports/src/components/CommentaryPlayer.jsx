@@ -268,6 +268,14 @@ export default function CommentaryPlayer({
     return `${mins}:${secs.toString().padStart(2, "0")}`;
   };
 
+  const isLive = audioInput.type === "live";
+
+  // Live mode: show the last 5 received captions as they arrive.
+  // Batch mode: show captions that overlap the current playback position.
+  const activeCaptions = isLive
+    ? captions.slice(-5)
+    : captions.filter((c) => currentTime >= c.startTime && currentTime <= c.endTime);
+
   const getSpeakerColor = (speaker) => {
     const colors = ["#2563eb", "#dc2626", "#16a34a", "#d97706", "#9333ea"];
     const num = parseInt(String(speaker).replace(/\D/g, "") || "0", 10);
@@ -289,19 +297,17 @@ export default function CommentaryPlayer({
         <div className="audio-info">
           <h3>{audioInput?.name || "Translation"}</h3>
           <p>
-            {audioInput?.type === "file" && "📁 Uploaded File"}
-            {audioInput?.type === "stream" && "🌐 Live Stream"}
-            {audioInput?.type === "recording" && "🎙️ Live Recording"}
-            {isStreaming && " • ⏳ Streaming…"}
+            {audioInput.type === "file" && "📁 Uploaded File"}
+            {audioInput.type === "stream" && "🌐 Live Stream"}
+            {audioInput.type === "recording" && "🎙️ Live Recording"}
+            {audioInput.type === "live" && "🔴 Live Translation"}
           </p>
         </div>
       </div>
 
-      {!isStreaming && audioInput?.source && (
-        <audio ref={audioRef} src={audioInput.source} />
-      )}
+      {!isLive && <audio ref={audioRef} src={audioInput.source} />}
 
-      {!isStreaming && audioInput?.source && (
+      {!isLive && (
         <div className="player-controls">
           <button onClick={togglePlay} className="play-button">
             {isPlaying ? "⏸" : "▶"}

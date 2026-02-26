@@ -1,12 +1,10 @@
-# api_server.py
-import os, base64, io, json
-from typing import Any, Iterator
-
+import os, tempfile, traceback, base64, json
+import io
 import torch, torchaudio
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-
+from fastapi.responses import Response, StreamingResponse
+from pydub import AudioSegment
 
 def wav_bytes_16k_mono(upload: UploadFile) -> bytes:
     data = upload.file.read()
@@ -55,39 +53,36 @@ def make_app(service: Any) -> FastAPI:
             "captions": captions,
         }
 
-    @app.post("/translate-audio-stream")
-    def translate_audio_stream(
+    @app.post("/session/start")
+    def session_start():
+        return {"session_id": service.create_session()}
+
+    @app.post("/session/end")
+    def session_end(session_id: str = Form(...)):
+        service.delete_session(session_id)
+        return {"ok": True}
+
+    @app.post("/translate-live")
+    def translate_live(
         audio: UploadFile = File(...),
+        session_id: str = Form(""),
         source_lang: str = Form("en"),
         target_lang: str = Form("hi"),
-        buffer_sec: float = Form(120.0),
     ):
         wav_bytes = wav_bytes_16k_mono(audio)
 
-        # This endpoint is designed to stream while running INSIDE the Modal container.
-        if not _running_on_modal():
-            raise HTTPException(
-                status_code=400,
-                detail="Streaming endpoint only supported on Modal deployment. Use /translate-audio locally.",
-            )
-
-        def ndjson() -> Iterator[bytes]:
+        def event_stream():
             try:
-                # IMPORTANT: this yields dict events from your TranslatorService generator
-                for event in service.translate_wav_bytes_stream_local(
-                    wav_bytes, source_lang, target_lang, buffer_sec
-                ):
-                    yield (json.dumps(event) + "\n").encode("utf-8")
+                for item in service.process_live_chunk(wav_bytes, session_id, source_lang, target_lang):
+                    yield f"data: {json.dumps(item)}\n\n"
             except Exception as e:
-                yield (json.dumps({"type": "error", "message": str(e)}) + "\n").encode("utf-8")
+                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
         return StreamingResponse(
-            ndjson(),
-            media_type="application/x-ndjson",
-            headers={
-                "Cache-Control": "no-cache, no-transform",
-                "X-Accel-Buffering": "no",
-            },
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     return app

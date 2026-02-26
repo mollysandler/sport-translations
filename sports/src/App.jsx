@@ -18,12 +18,16 @@ export default function App() {
   const handleAudioSelected = (data) => {
     setAudioInput(data);
     // If the data contains captions (from backend), set them.
-    // Otherwise (e.g. stream/recording without translation yet), clear them.
-    if (data.captions) {
+    // Otherwise (e.g. stream/live start), clear them.
+    if (data.captions && data.captions.length > 0) {
       setCaptions(data.captions);
     } else {
       setCaptions([]);
     }
+  };
+
+  const handleLiveCaptionAdded = (caption) => {
+    setCaptions((prev) => [...prev, caption]);
   };
 
   return (
@@ -49,6 +53,7 @@ export default function App() {
               sourceLanguage={sourceLanguage}
               targetLanguage={targetLanguage}
               onAudioSelected={handleAudioSelected}
+              onLiveCaptionAdded={handleLiveCaptionAdded}
             />
 
             {audioInput && (
