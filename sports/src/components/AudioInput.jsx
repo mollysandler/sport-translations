@@ -444,18 +444,6 @@ export default function AudioInput({
         </div>
       </div>
 
-      <div style={{ marginTop: 12, fontSize: 13, opacity: 0.85 }}>
-        <div>
-          <strong>API:</strong> {API_BASE}/translate-audio-stream
-        </div>
-        <div style={{ minHeight: 18, marginTop: 6 }}>
-          {busy || recording ? (
-            <span>{status}</span>
-          ) : status ? (
-            <span>{status}</span>
-          ) : null}
-        </div>
-      </div>
     </div>
   );
 }
