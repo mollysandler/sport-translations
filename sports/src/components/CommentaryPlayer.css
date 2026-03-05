@@ -103,49 +103,6 @@
   color: #666;
 }
 
-.speaker-selector {
-  margin-bottom: 1.5rem;
-  padding: 1rem;
-  background-color: #f9fafb;
-  border-radius: 6px;
-}
-
-.speaker-selector label {
-  display: block;
-  font-size: 0.875rem;
-  font-weight: 600;
-  margin-bottom: 0.75rem;
-  color: #333;
-}
-
-.gender-options {
-  display: flex;
-  gap: 0.75rem;
-}
-
-.gender-button {
-  flex: 1;
-  padding: 0.75rem;
-  border: 2px solid #ddd;
-  background-color: white;
-  border-radius: 6px;
-  cursor: pointer;
-  font-weight: 500;
-  font-size: 0.875rem;
-  transition: all 0.2s;
-}
-
-.gender-button:hover {
-  border-color: #1e40af;
-  background-color: #f0f7ff;
-}
-
-.gender-button.active {
-  background-color: #1e40af;
-  color: white;
-  border-color: #1e40af;
-}
-
 .commentary-display {
   margin-bottom: 1rem;
 }

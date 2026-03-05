@@ -3,6 +3,7 @@
   border-radius: 8px;
   padding: 1.5rem;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  position: relative;
 }
 
 .audio-input-card h2 {
@@ -137,6 +138,58 @@
   font-size: 0.875rem;
   color: #999;
   margin-top: -0.5rem;
+}
+
+.sample-links {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.sample-label {
+  font-size: 0.8rem;
+  color: #999;
+}
+
+.sample-link-button {
+  padding: 0.3rem 0.6rem;
+  font-size: 0.8rem;
+  background: #f0f4ff;
+  color: #1e40af;
+  border: 1px solid #c7d2fe;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.sample-link-button:hover {
+  background: #1e40af;
+  color: white;
+}
+
+.loading-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(255, 255, 255, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  font-weight: 600;
+  color: #1e40af;
+  z-index: 10;
+}
+
+.stream-section {
+  padding: 1rem 0;
+}
+
+.stream-url-display {
+  font-size: 0.8rem;
+  color: #666;
+  word-break: break-all;
+  margin-bottom: 0.5rem;
 }
 
 .record-section {

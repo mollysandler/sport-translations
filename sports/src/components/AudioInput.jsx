@@ -73,6 +73,7 @@ export default function AudioInput({
   const [streamUrl, setStreamUrl] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [liveStatus, setLiveStatus] = useState("idle"); // idle | streaming | stopping
+  const [streamStatus, setStreamStatus] = useState("idle"); // idle | streaming | stopping
 
   const sessionIdRef = useRef(null);
   const micStreamRef = useRef(null);
@@ -84,6 +85,7 @@ export default function AudioInput({
   const nativeSRRef = useRef(44100);
   const audioQueueRef = useRef([]);
   const isPlayingAudioRef = useRef(false);
+  const streamAbortRef = useRef(null);    // AbortController for stream URL
 
   // ── Batch file upload (unchanged) ──────────────────────────────────────────
 
@@ -128,18 +130,93 @@ export default function AudioInput({
     if (file) processAudioOnBackend(file, file.name);
   };
 
-  const handleStreamUrlSubmit = (e) => {
+  const handleStartStream = async (e) => {
     e.preventDefault();
-    if (streamUrl.trim()) {
-      onAudioSelected({
-        type: "stream",
-        source: streamUrl,
-        name: "Live Stream",
-        timestamp: new Date(),
+    if (!streamUrl.trim()) return;
+
+    setStreamStatus("streaming");
+
+    // Create session
+    const res = await fetch(`${BASE_URL}/session/start`, { method: "POST" });
+    const { session_id } = await res.json();
+    sessionIdRef.current = session_id;
+
+    // Playback AudioContext
+    audioCtxRef.current = new AudioContext();
+    audioQueueRef.current = [];
+    isPlayingAudioRef.current = false;
+
+    // Signal live mode to parent
+    onAudioSelected({
+      type: "live",
+      source: null,
+      name: "Stream Translation",
+      timestamp: new Date(),
+      captions: [],
+    });
+
+    // Start SSE stream
+    const abortController = new AbortController();
+    streamAbortRef.current = abortController;
+
+    const formData = new FormData();
+    formData.append("url", streamUrl.trim());
+    formData.append("session_id", session_id);
+    formData.append("source_lang", sourceLanguage);
+    formData.append("target_lang", targetLanguage);
+
+    try {
+      const response = await fetch(`${BASE_URL}/translate-stream`, {
+        method: "POST",
+        body: formData,
+        signal: abortController.signal,
       });
-      setStreamUrl("");
+
+      for await (const item of readSseEvents(response)) {
+        if (item.type === "segment") {
+          audioQueueRef.current.push(item.audio_b64);
+          drainAudioQueue();
+          if (onLiveCaptionAdded) onLiveCaptionAdded(item.caption);
+        } else if (item.type === "error") {
+          console.error("Stream error:", item.message);
+        } else if (item.type === "done") {
+          break;
+        }
+      }
+    } catch (err) {
+      if (err.name !== "AbortError") {
+        console.error("Stream fetch error:", err);
+      }
     }
-  }
+
+    // Stream ended naturally or was stopped
+    setStreamStatus("idle");
+  };
+
+  const handleStopStream = async () => {
+    setStreamStatus("stopping");
+
+    // Abort the SSE fetch
+    if (streamAbortRef.current) {
+      streamAbortRef.current.abort();
+      streamAbortRef.current = null;
+    }
+
+    // Clean up session
+    if (sessionIdRef.current) {
+      const fd = new FormData();
+      fd.append("session_id", sessionIdRef.current);
+      await fetch(`${BASE_URL}/session/end`, { method: "POST", body: fd }).catch(() => {});
+      sessionIdRef.current = null;
+    }
+
+    if (audioCtxRef.current) {
+      await audioCtxRef.current.close().catch(() => {});
+      audioCtxRef.current = null;
+    }
+
+    setStreamStatus("idle");
+  };
 
   // ── Audio playback queue (Web Audio API) ───────────────────────────────────
 
@@ -389,23 +466,59 @@ export default function AudioInput({
           )}
 
           {inputMethod === "stream" && (
-            <form onSubmit={handleStreamUrlSubmit} className="stream-form">
-              <div className="stream-input-group">
-                <input
-                  type="url"
-                  placeholder="Enter stream URL (e.g., https://example.com/stream.m3u8)"
-                  value={streamUrl}
-                  onChange={(e) => setStreamUrl(e.target.value)}
-                  className="stream-input"
-                />
-                <button type="submit" className="submit-button">
-                  Connect Stream
-                </button>
-              </div>
-              <p className="stream-hint">
-                Supports HLS, DASH, and direct audio streams
-              </p>
-            </form>
+            <div className="stream-section">
+              {streamStatus === "streaming" ? (
+                <div className="recording-active">
+                  <div className="recording-indicator">
+                    <span className="recording-dot"></span>
+                    Streaming — translating every 8s...
+                  </div>
+                  <p className="stream-url-display">{streamUrl}</p>
+                  <button onClick={handleStopStream} className="record-button stop">
+                    Stop Stream
+                  </button>
+                </div>
+              ) : streamStatus === "stopping" ? (
+                <div className="recording-active">
+                  <p>Stopping...</p>
+                </div>
+              ) : (
+                <form onSubmit={handleStartStream} className="stream-form">
+                  <div className="stream-input-group">
+                    <input
+                      type="url"
+                      placeholder="Paste a URL to an audio file or stream"
+                      value={streamUrl}
+                      onChange={(e) => setStreamUrl(e.target.value)}
+                      className="stream-input"
+                    />
+                    <button type="submit" className="submit-button">
+                      Start
+                    </button>
+                  </div>
+                  <p className="stream-hint">
+                    Paste any direct link to an audio stream. Translates continuously in 8-second chunks.
+                  </p>
+                  <div className="sample-links">
+                    <span className="sample-label">Try a sample:</span>
+                    {[
+                      { label: "BBC News (EN)", url: "https://stream.live.vc.bbcmedia.co.uk/bbc_world_service" },
+                      { label: "France Info (FR)", url: "https://stream.radiofrance.fr/franceinfo/franceinfo_hifi.m3u8" },
+                      { label: "Deutsche Welle (DE)", url: "https://rbmn-live.akamaized.net/hls/live/590198/dwstream5/index.m3u8" },
+                    ].map((s) => (
+                      <button
+                        key={s.url}
+                        type="button"
+                        className="sample-link-button"
+                        onClick={() => setStreamUrl(s.url)}
+                      >
+                        {s.label}
+                      </button>
+                    ))}
+                  </div>
+                </form>
+              )}
+            </div>
           )}
 
           {inputMethod === "record" && (

@@ -43,38 +43,15 @@ body {
 .app-main {
   flex: 1;
   padding: 2rem;
-  max-width: 1200px;
+  max-width: 900px;
   margin: 0 auto;
   width: 100%;
-}
-
-.content-grid {
-  display: grid;
-  grid-template-columns: 1fr 350px;
-  gap: 2rem;
-}
-
-.primary-section {
   display: flex;
   flex-direction: column;
   gap: 2rem;
 }
 
-.feedback-section {
-  position: sticky;
-  top: 2rem;
-  height: fit-content;
-}
-
 @media (max-width: 1024px) {
-  .content-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .feedback-section {
-    position: static;
-  }
-
   .header-content h1 {
     font-size: 1.5rem;
   }
