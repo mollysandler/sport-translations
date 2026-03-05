@@ -10,6 +10,9 @@ export default function CommentaryPlayer({
   targetLanguage,
   isPlaying,
   onPlayingChange,
+  isConnecting,
+  onDownloadSrt,
+  onDownloadAudio,
 }) {
   const audioRef = useRef(null);
   const scrollRef = useRef(null);
@@ -95,6 +98,16 @@ export default function CommentaryPlayer({
             {audioInput.type === "live" && "Live Translation"}
           </p>
         </div>
+        {captions.length > 0 && (
+          <div className="download-buttons">
+            <button className="download-button" onClick={onDownloadSrt}>
+              Download SRT
+            </button>
+            <button className="download-button" onClick={onDownloadAudio}>
+              Download Audio
+            </button>
+          </div>
+        )}
       </div>
 
       {!isLive && <audio ref={audioRef} src={audioInput.source} />}
@@ -145,9 +158,11 @@ export default function CommentaryPlayer({
                 ))
               ) : (
                 <p className="placeholder-text">
-                  {isLive
-                    ? "Streaming translation..."
-                    : "Waiting for commentary..."}
+                  {isConnecting
+                    ? "Waiting for server..."
+                    : isLive
+                      ? "Streaming translation..."
+                      : "Waiting for commentary..."}
                 </p>
               )}
             </div>
@@ -172,9 +187,11 @@ export default function CommentaryPlayer({
                 ))
               ) : (
                 <p className="placeholder-text">
-                  {isLive
-                    ? "Streaming translation..."
-                    : "Waiting for translation..."}
+                  {isConnecting
+                    ? "Waiting for server..."
+                    : isLive
+                      ? "Streaming translation..."
+                      : "Waiting for translation..."}
                 </p>
               )}
             </div>

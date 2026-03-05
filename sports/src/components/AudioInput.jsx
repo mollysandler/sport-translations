@@ -8,7 +8,7 @@ const BASE_URL =
 
 const CHUNK_SECONDS = 8;
 
-// ── WAV encoding helpers ──────────────────────────────────────────────────────
+// -- WAV encoding helpers ----------------------------------------------------
 
 function encodeWav(samples, sampleRate) {
   const buffer = new ArrayBuffer(44 + samples.length * 2);
@@ -37,7 +37,7 @@ function encodeWav(samples, sampleRate) {
   return buffer;
 }
 
-// ── SSE line parser ───────────────────────────────────────────────────────────
+// -- SSE line parser ---------------------------------------------------------
 
 async function* readSseEvents(response) {
   const reader = response.body.getReader();
@@ -61,19 +61,21 @@ async function* readSseEvents(response) {
   }
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
+// -- Component ---------------------------------------------------------------
 
 export default function AudioInput({
   sourceLanguage,
   targetLanguage,
   onAudioSelected,
   onLiveCaptionAdded,
+  onConnectionStatusChange,
+  audioSegmentsRef,
 }) {
   const [inputMethod, setInputMethod] = useState("upload");
   const [streamUrl, setStreamUrl] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [liveStatus, setLiveStatus] = useState("idle"); // idle | streaming | stopping
-  const [streamStatus, setStreamStatus] = useState("idle"); // idle | streaming | stopping
+  const [liveStatus, setLiveStatus] = useState("idle"); // idle | connecting | streaming | stopping
+  const [streamStatus, setStreamStatus] = useState("idle"); // idle | connecting | streaming | stopping
 
   const sessionIdRef = useRef(null);
   const micStreamRef = useRef(null);
@@ -86,8 +88,10 @@ export default function AudioInput({
   const audioQueueRef = useRef([]);
   const isPlayingAudioRef = useRef(false);
   const streamAbortRef = useRef(null);    // AbortController for stream URL
+  const sessionAbortRef = useRef(null);   // AbortController for /session/start
+  const firstSegmentReceivedRef = useRef(false);
 
-  // ── Batch file upload (unchanged) ──────────────────────────────────────────
+  // -- Batch file upload (unchanged) ----------------------------------------
 
   const processAudioOnBackend = async (audioBlob, fileName) => {
     setIsLoading(true);
@@ -134,11 +138,36 @@ export default function AudioInput({
     e.preventDefault();
     if (!streamUrl.trim()) return;
 
-    setStreamStatus("streaming");
+    setStreamStatus("connecting");
+    if (onConnectionStatusChange) onConnectionStatusChange(true);
+    firstSegmentReceivedRef.current = false;
 
-    // Create session
-    const res = await fetch(`${BASE_URL}/session/start`, { method: "POST" });
-    const { session_id } = await res.json();
+    // Reset accumulated audio segments
+    if (audioSegmentsRef) audioSegmentsRef.current = [];
+
+    // Create session (with abort support)
+    const sessionAbort = new AbortController();
+    sessionAbortRef.current = sessionAbort;
+
+    let session_id;
+    try {
+      const res = await fetch(`${BASE_URL}/session/start`, {
+        method: "POST",
+        signal: sessionAbort.signal,
+      });
+      const data = await res.json();
+      session_id = data.session_id;
+    } catch (err) {
+      if (err.name === "AbortError") {
+        setStreamStatus("idle");
+        if (onConnectionStatusChange) onConnectionStatusChange(false);
+        return;
+      }
+      console.error("Session start error:", err);
+      setStreamStatus("idle");
+      if (onConnectionStatusChange) onConnectionStatusChange(false);
+      return;
+    }
     sessionIdRef.current = session_id;
 
     // Playback AudioContext
@@ -174,7 +203,14 @@ export default function AudioInput({
 
       for await (const item of readSseEvents(response)) {
         if (item.type === "segment") {
+          // Transition from connecting -> streaming on first segment
+          if (!firstSegmentReceivedRef.current) {
+            firstSegmentReceivedRef.current = true;
+            setStreamStatus("streaming");
+            if (onConnectionStatusChange) onConnectionStatusChange(false);
+          }
           audioQueueRef.current.push(item.audio_b64);
+          if (audioSegmentsRef) audioSegmentsRef.current.push(item.audio_b64);
           drainAudioQueue();
           if (onLiveCaptionAdded) onLiveCaptionAdded(item.caption);
         } else if (item.type === "error") {
@@ -190,11 +226,19 @@ export default function AudioInput({
     }
 
     // Stream ended naturally or was stopped
+    if (onConnectionStatusChange) onConnectionStatusChange(false);
     setStreamStatus("idle");
   };
 
   const handleStopStream = async () => {
     setStreamStatus("stopping");
+    if (onConnectionStatusChange) onConnectionStatusChange(false);
+
+    // Abort session start if still in progress
+    if (sessionAbortRef.current) {
+      sessionAbortRef.current.abort();
+      sessionAbortRef.current = null;
+    }
 
     // Abort the SSE fetch
     if (streamAbortRef.current) {
@@ -218,7 +262,7 @@ export default function AudioInput({
     setStreamStatus("idle");
   };
 
-  // ── Audio playback queue (Web Audio API) ───────────────────────────────────
+  // -- Audio playback queue (Web Audio API) ----------------------------------
 
   const drainAudioQueue = async () => {
     if (isPlayingAudioRef.current) return;
@@ -246,11 +290,7 @@ export default function AudioInput({
     isPlayingAudioRef.current = false;
   };
 
-  // ── Resample raw PCM → 16 kHz WAV and POST to /translate-live ─────────────
-  //
-  // Accepts a Float32Array captured at nativeSR.  Resamples via OfflineAudioContext
-  // (same approach as blobToWav16kMono, but without the WebM decode step that
-  // silently fails on header-less MediaRecorder fragments after the first chunk).
+  // -- Resample raw PCM -> 16 kHz WAV and POST to /translate-live -----------
 
   const sendPcmChunk = async (samples) => {
     if (!sessionIdRef.current || samples.length < 100) return;
@@ -296,7 +336,14 @@ export default function AudioInput({
 
     for await (const item of readSseEvents(response)) {
       if (item.type === "segment") {
+        // Transition from connecting -> streaming on first segment
+        if (!firstSegmentReceivedRef.current) {
+          firstSegmentReceivedRef.current = true;
+          setLiveStatus("streaming");
+          if (onConnectionStatusChange) onConnectionStatusChange(false);
+        }
         audioQueueRef.current.push(item.audio_b64);
+        if (audioSegmentsRef) audioSegmentsRef.current.push(item.audio_b64);
         drainAudioQueue();
         if (onLiveCaptionAdded) onLiveCaptionAdded(item.caption);
       } else if (item.type === "error") {
@@ -305,14 +352,39 @@ export default function AudioInput({
     }
   };
 
-  // ── Start / stop live ─────────────────────────────────────────────────────
+  // -- Start / stop live ----------------------------------------------------
 
   const handleStartLive = async () => {
-    setLiveStatus("streaming");
+    setLiveStatus("connecting");
+    if (onConnectionStatusChange) onConnectionStatusChange(true);
+    firstSegmentReceivedRef.current = false;
 
-    // Session
-    const res = await fetch(`${BASE_URL}/session/start`, { method: "POST" });
-    const { session_id } = await res.json();
+    // Reset accumulated audio segments
+    if (audioSegmentsRef) audioSegmentsRef.current = [];
+
+    // Session (with abort support)
+    const sessionAbort = new AbortController();
+    sessionAbortRef.current = sessionAbort;
+
+    let session_id;
+    try {
+      const res = await fetch(`${BASE_URL}/session/start`, {
+        method: "POST",
+        signal: sessionAbort.signal,
+      });
+      const data = await res.json();
+      session_id = data.session_id;
+    } catch (err) {
+      if (err.name === "AbortError") {
+        setLiveStatus("idle");
+        if (onConnectionStatusChange) onConnectionStatusChange(false);
+        return;
+      }
+      console.error("Session start error:", err);
+      setLiveStatus("idle");
+      if (onConnectionStatusChange) onConnectionStatusChange(false);
+      return;
+    }
     sessionIdRef.current = session_id;
 
     // Playback AudioContext
@@ -321,7 +393,15 @@ export default function AudioInput({
     isPlayingAudioRef.current = false;
 
     // Microphone
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      console.error("Microphone access denied:", err);
+      setLiveStatus("idle");
+      if (onConnectionStatusChange) onConnectionStatusChange(false);
+      return;
+    }
     micStreamRef.current = stream;
 
     // Signal to parent: live mode started
@@ -333,11 +413,7 @@ export default function AudioInput({
       captions: [],
     });
 
-    // ── ScriptProcessor for raw PCM capture ──────────────────────────────────
-    // Unlike MediaRecorder, ScriptProcessor yields raw Float32 PCM on every
-    // callback.  Every chunk is independently encodable — no WebM header
-    // fragmentation that silently breaks decodeAudioData after the first blob.
-
+    // -- ScriptProcessor for raw PCM capture --------------------------------
     const captureCtx = new AudioContext();
     captureCtxRef.current = captureCtx;
     const nativeSR = captureCtx.sampleRate;
@@ -354,7 +430,6 @@ export default function AudioInput({
 
     processor.onaudioprocess = (e) => {
       const input = e.inputBuffer.getChannelData(0);
-      // Append incoming samples to rolling buffer
       const prev = pcmBufferRef.current;
       const next = new Float32Array(prev.length + input.length);
       next.set(prev);
@@ -369,8 +444,6 @@ export default function AudioInput({
     };
 
     sourceNode.connect(processor);
-    // Muted gain node required: Chrome only fires onaudioprocess when the graph
-    // is connected to a destination; gain=0 avoids mic-to-speaker feedback.
     const muteGain = captureCtx.createGain();
     muteGain.gain.value = 0;
     processor.connect(muteGain);
@@ -379,6 +452,13 @@ export default function AudioInput({
 
   const handleStopLive = async () => {
     setLiveStatus("stopping");
+    if (onConnectionStatusChange) onConnectionStatusChange(false);
+
+    // Abort session start if still in progress
+    if (sessionAbortRef.current) {
+      sessionAbortRef.current.abort();
+      sessionAbortRef.current = null;
+    }
 
     // Flush any remaining buffered audio (> 1 second)
     const remaining = pcmBufferRef.current;
@@ -417,7 +497,7 @@ export default function AudioInput({
     setLiveStatus("idle");
   };
 
-  // ── Render ────────────────────────────────────────────────────────────────
+  // -- Render ---------------------------------------------------------------
 
   return (
     <div className="audio-input-card">
@@ -467,7 +547,18 @@ export default function AudioInput({
 
           {inputMethod === "stream" && (
             <div className="stream-section">
-              {streamStatus === "streaming" ? (
+              {streamStatus === "connecting" ? (
+                <div className="connecting-indicator">
+                  <div className="connecting-spinner"></div>
+                  <p>Connecting to server...</p>
+                  <p className="connecting-hint">
+                    This may take 30-60s on first request while the GPU warms up
+                  </p>
+                  <button onClick={handleStopStream} className="record-button stop">
+                    Cancel
+                  </button>
+                </div>
+              ) : streamStatus === "streaming" ? (
                 <div className="recording-active">
                   <div className="recording-indicator">
                     <span className="recording-dot"></span>
@@ -523,7 +614,18 @@ export default function AudioInput({
 
           {inputMethod === "record" && (
             <div className="record-section">
-              {liveStatus === "streaming" ? (
+              {liveStatus === "connecting" ? (
+                <div className="connecting-indicator">
+                  <div className="connecting-spinner"></div>
+                  <p>Connecting to server...</p>
+                  <p className="connecting-hint">
+                    This may take 30-60s on first request while the GPU warms up
+                  </p>
+                  <button onClick={handleStopLive} className="record-button stop">
+                    Cancel
+                  </button>
+                </div>
+              ) : liveStatus === "streaming" ? (
                 <div className="recording-active">
                   <div className="recording-indicator">
                     <span className="recording-dot"></span>
@@ -545,7 +647,7 @@ export default function AudioInput({
                   onClick={handleStartLive}
                   className="record-button start"
                 >
-                  🎤 Start Live Translation
+                  Start Live Translation
                 </button>
               )}
               <p className="record-hint">
