@@ -28,7 +28,17 @@ export default function LanguageSelector({ sourceLanguage, targetLanguage, onSou
       <h2>Select Languages</h2>
       <div className="language-controls">
         <div className="language-select-group">
-          <label htmlFor="source-lang">From:</label>
+          <label htmlFor="source-lang">
+            From:
+            {sourceLanguage === "auto" && detectedLanguage && (() => {
+              const detected = LANGUAGES.find((l) => l.code === detectedLanguage);
+              return (
+                <span className="detected-language-indicator">
+                  {detected ? `${detected.flag} ${detected.name}` : detectedLanguage}
+                </span>
+              );
+            })()}
+          </label>
           <select
             id="source-lang"
             value={sourceLanguage}
@@ -41,14 +51,6 @@ export default function LanguageSelector({ sourceLanguage, targetLanguage, onSou
               </option>
             ))}
           </select>
-          {sourceLanguage === "auto" && detectedLanguage && (() => {
-            const detected = LANGUAGES.find((l) => l.code === detectedLanguage);
-            return (
-              <span className="detected-language-indicator">
-                Detected: {detected ? `${detected.flag} ${detected.name}` : detectedLanguage}
-              </span>
-            );
-          })()}
         </div>
 
         {sourceLanguage !== "auto" && (

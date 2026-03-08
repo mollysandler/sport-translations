@@ -77,10 +77,13 @@
 }
 
 .detected-language-indicator {
-  font-size: 0.8rem;
-  color: #2563eb;
-  margin-top: 0.25rem;
-  display: block;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: #1e40af;
+  background: #eff3ff;
+  padding: 0.15rem 0.5rem;
+  border-radius: 9999px;
+  margin-left: 0.5rem;
 }
 
 @media (max-width: 640px) {
