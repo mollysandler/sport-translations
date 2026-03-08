@@ -98,7 +98,9 @@ class TranslatorService:
         try:
             with open(path, "wb") as f:
                 f.write(wav_bytes)
-            return translator.translate_audio_file_no_playback(path)
+            result = translator.translate_audio_file_no_playback(path)
+            # Returns (mp3_bytes, captions, detected_language)
+            return result
         finally:
             try:
                 os.remove(path)

@@ -611,7 +611,13 @@ class DynamicSpeakerTranslator:
         
         # Voice mapping
         self.speaker_voice_ids = {}
-    
+        self.detected_language = None
+
+        # Batch concurrency lock — serialises translate_audio_file_no_playback
+        # and translate_audio_file_stream so two concurrent batch requests for
+        # the same language pair don't corrupt shared instance state.
+        self.batch_lock = threading.Lock()
+
     def _initialize_services(self):
         """Initialize all required services"""
         print("🔧 Initializing optimized services...")
@@ -1020,9 +1026,10 @@ class DynamicSpeakerTranslator:
                 # Reference transcript (helps Qwen prompt quality; optional)
                 ref_text = ""
                 try:
+                    ref_whisper_lang = self.source_lang if self.source_lang != "auto" else None
                     segs, _ = self.whisper.transcribe(
                         ref_np,
-                        language=self.source_lang,
+                        language=ref_whisper_lang,
                         beam_size=1,
                         vad_filter=False,
                         condition_on_previous_text=False
@@ -1370,14 +1377,17 @@ class DynamicSpeakerTranslator:
             # ----------------------------
             # 2) ASR (Faster-Whisper)
             # ----------------------------
-            segments_whisper, _ = self.whisper.transcribe(
+            whisper_lang = self.source_lang if self.source_lang != "auto" else None
+            segments_whisper, whisper_info = self.whisper.transcribe(
                 audio_np,
-                language=self.source_lang,
+                language=whisper_lang,
                 beam_size=1,
                 vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 250},
                 condition_on_previous_text=False,
             )
+            if self.detected_language is None and hasattr(whisper_info, "language"):
+                self.detected_language = whisper_info.language
 
             text_parts = [s.text.strip() for s in segments_whisper if s.text and s.text.strip()]
             if not text_parts:
@@ -1768,69 +1778,71 @@ class DynamicSpeakerTranslator:
         - no playback thread
         - returns (mp3_bytes, captions_list)
         """
-        with self.segments_lock:
-            self.all_segments = []
-        while not self.playback_queue.empty():
-            self.playback_queue.get_nowait()
-            self.playback_queue.task_done()
-        self.processing_complete.clear()
-        self.error_occurred.clear()
-        self.error_message = None
+        with self.batch_lock:
+            with self.segments_lock:
+                self.all_segments = []
+            while not self.playback_queue.empty():
+                self.playback_queue.get_nowait()
+                self.playback_queue.task_done()
+            self.processing_complete.clear()
+            self.error_occurred.clear()
+            self.error_message = None
+            self.detected_language = None
 
-        audio, sr = torchaudio.load(wav_path)
+            audio, sr = torchaudio.load(wav_path)
 
-        if audio.shape[0] > 1:
-            audio = torch.mean(audio, dim=0, keepdim=True)
+            if audio.shape[0] > 1:
+                audio = torch.mean(audio, dim=0, keepdim=True)
 
-        if sr != self.sample_rate:
-            resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
-            audio = resampler(audio)
+            if sr != self.sample_rate:
+                resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
+                audio = resampler(audio)
 
-        total_duration_sec = audio.shape[1] / self.sample_rate
+            total_duration_sec = audio.shape[1] / self.sample_rate
 
-        speaker_segments = self._get_speaker_segments(audio, wav_path)
+            speaker_segments = self._get_speaker_segments(audio, wav_path)
 
-        if self.use_voice_cloning:
-            self.speaker_voice_ids = self._create_speaker_voice_clones(
-                audio, speaker_segments, self.sample_rate
-            )
-        else:
-            self.speaker_voice_ids = self.voice_manager.assign_voices(
-                audio, speaker_segments, self.sample_rate
-            )
+            if self.use_voice_cloning:
+                self.speaker_voice_ids = self._create_speaker_voice_clones(
+                    audio, speaker_segments, self.sample_rate
+                )
+            else:
+                self.speaker_voice_ids = self.voice_manager.assign_voices(
+                    audio, speaker_segments, self.sample_rate
+                )
 
-        # Process segments (parallel) but we won't play them.
-        self._process_segments_parallel(audio, speaker_segments)
+            # Process segments (parallel) but we won't play them.
+            self._process_segments_parallel(audio, speaker_segments)
 
-        # Drain queue if you want; we rely on self.all_segments for final assembly
-        # while not self.playback_queue.empty():
-        #     _ = self.playback_queue.get_nowait()
-        #     self.playback_queue.task_done()
+            # Drain queue if you want; we rely on self.all_segments for final assembly
+            # while not self.playback_queue.empty():
+            #     _ = self.playback_queue.get_nowait()
+            #     self.playback_queue.task_done()
 
-        with self.segments_lock:
-            segments = list(self.all_segments)
+            with self.segments_lock:
+                segments = list(self.all_segments)
 
-        final_audio = self._compose_audio(segments, total_duration_sec)
+            final_audio = self._compose_audio(segments, total_duration_sec)
 
-        # Export MP3 bytes for the frontend
-        mp3_io = io.BytesIO()
-        final_audio.export(mp3_io, format="mp3")
-        mp3_bytes = mp3_io.getvalue()
+            # Export MP3 bytes for the frontend
+            mp3_io = io.BytesIO()
+            final_audio.export(mp3_io, format="mp3")
+            mp3_bytes = mp3_io.getvalue()
 
-        # Captions shaped for CommentaryPlayer.jsx
-        captions = [
-            {
-                "speaker": s.speaker_id,
-                "startTime": s.start_ms / 1000.0,
-                "endTime": s.end_ms / 1000.0,
-                "original": s.original_text,
-                "translated": s.translated_text,
-            }
-            for s in segments
-        ]
+            # Captions shaped for CommentaryPlayer.jsx
+            captions = [
+                {
+                    "speaker": s.speaker_id,
+                    "startTime": s.start_ms / 1000.0,
+                    "endTime": s.end_ms / 1000.0,
+                    "original": s.original_text,
+                    "translated": s.translated_text,
+                }
+                for s in segments
+            ]
 
-        return mp3_bytes, captions
-    
+            return mp3_bytes, captions, self.detected_language
+
     def translate_audio_file_stream(
         self,
         wav_path: str,
@@ -1849,131 +1861,135 @@ class DynamicSpeakerTranslator:
           {type:"error", message}
         """
 
-        # Reset state (same spirit as translate_audio_file_no_playback)
-        with self.segments_lock:
-            self.all_segments = []
-        while not self.playback_queue.empty():
-            try:
-                self.playback_queue.get_nowait()
-                self.playback_queue.task_done()
-            except Exception:
-                break
-        self.processing_complete.clear()
-        self.error_occurred.clear()
-        self.error_message = None
-
-        # Load / normalize audio
-        audio, sr = torchaudio.load(wav_path)
-        if audio.shape[0] > 1:
-            audio = torch.mean(audio, dim=0, keepdim=True)
-        if sr != self.sample_rate:
-            resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
-            audio = resampler(audio)
-
-        total_duration_sec = audio.shape[1] / self.sample_rate
-
-        # Diarize
-        speaker_segments = self._get_speaker_segments(audio, wav_path)
-
-        # Assign voices (same as non-stream path)
-        if self.use_voice_cloning:
-            self.speaker_voice_ids = self._create_speaker_voice_clones(
-                audio, speaker_segments, self.sample_rate
-            )
-        else:
-            self.speaker_voice_ids = self.voice_manager.assign_voices(
-                audio, speaker_segments, self.sample_rate
-            )
-
-        # Compute buffer target as "how much original timeline we want ready before playback"
-        buffer_target_ms = int(buffer_duration_sec * 1000)
-        buffered_until_ms = 0
-        buffered_segments = 0
-
-        yield {
-            "type": "start",
-            "total_duration_sec": total_duration_sec,
-            "buffer_duration_sec": buffer_duration_sec,
-            "segments_total": len(speaker_segments),
-        }
-
-        # Start processing in a background thread (so we can stream queue output)
-        t = threading.Thread(
-            target=self._process_segments_parallel,
-            args=(audio, speaker_segments),
-            daemon=True,
-        )
-        t.start()
-
-        captions_out = []
-        last_heartbeat = time.time()
-
-        # Stream segments as they become available in-order
-        while True:
-            # Error path
-            if self.error_occurred.is_set():
-                msg = self.error_message or "Unknown error"
-                yield {"type": "error", "message": msg}
-                return
-
-            try:
-                seg = self.playback_queue.get(timeout=0.5)
-                self.playback_queue.task_done()
-
-                # Update buffering progress based on ORIGINAL timeline end
-                buffered_segments += 1
-                buffered_until_ms = max(buffered_until_ms, int(seg.end_ms))
-
-                # Emit buffering status occasionally until buffer is reached
-                if buffered_until_ms < buffer_target_ms:
-                    yield {
-                        "type": "buffering",
-                        "buffered_until_sec": buffered_until_ms / 1000.0,
-                        "buffered_segments": buffered_segments,
-                        "buffer_target_sec": buffer_duration_sec,
-                    }
-
-                caption = {
-                    "speaker": seg.speaker_id,
-                    "startTime": seg.start_ms / 1000.0,
-                    "endTime": seg.end_ms / 1000.0,
-                    "original": seg.original_text,
-                    "translated": seg.translated_text,
-                }
-                captions_out.append(caption)
-
-                yield {"type": "segment", "caption": caption}
-
-            except queue.Empty:
-                # Heartbeat so the client/proxy doesn't think the connection died
-                now = time.time()
-                if now - last_heartbeat >= heartbeat_sec:
-                    yield {
-                        "type": "heartbeat",
-                        "processing_complete": self.processing_complete.is_set(),
-                        "buffered_until_sec": buffered_until_ms / 1000.0,
-                    }
-                    last_heartbeat = now
-
-                # Stop when processing is done and nothing left to emit
-                if self.processing_complete.is_set():
+        self.batch_lock.acquire()
+        try:
+            # Reset state (same spirit as translate_audio_file_no_playback)
+            with self.segments_lock:
+                self.all_segments = []
+            while not self.playback_queue.empty():
+                try:
+                    self.playback_queue.get_nowait()
+                    self.playback_queue.task_done()
+                except Exception:
                     break
+            self.processing_complete.clear()
+            self.error_occurred.clear()
+            self.error_message = None
 
-        # Build final MP3 (same as non-stream path)
-        with self.segments_lock:
-            segments = list(self.all_segments)
+            # Load / normalize audio
+            audio, sr = torchaudio.load(wav_path)
+            if audio.shape[0] > 1:
+                audio = torch.mean(audio, dim=0, keepdim=True)
+            if sr != self.sample_rate:
+                resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
+                audio = resampler(audio)
 
-        final_audio = self._compose_audio(segments, total_duration_sec)
-        mp3_io = io.BytesIO()
-        final_audio.export(mp3_io, format="mp3")
-        mp3_bytes = mp3_io.getvalue()
+            total_duration_sec = audio.shape[1] / self.sample_rate
 
-        import base64
-        yield {
-            "type": "final",
-            "audio_base64": base64.b64encode(mp3_bytes).decode("utf-8"),
-            "captions": captions_out,
-        }
+            # Diarize
+            speaker_segments = self._get_speaker_segments(audio, wav_path)
+
+            # Assign voices (same as non-stream path)
+            if self.use_voice_cloning:
+                self.speaker_voice_ids = self._create_speaker_voice_clones(
+                    audio, speaker_segments, self.sample_rate
+                )
+            else:
+                self.speaker_voice_ids = self.voice_manager.assign_voices(
+                    audio, speaker_segments, self.sample_rate
+                )
+
+            # Compute buffer target as "how much original timeline we want ready before playback"
+            buffer_target_ms = int(buffer_duration_sec * 1000)
+            buffered_until_ms = 0
+            buffered_segments = 0
+
+            yield {
+                "type": "start",
+                "total_duration_sec": total_duration_sec,
+                "buffer_duration_sec": buffer_duration_sec,
+                "segments_total": len(speaker_segments),
+            }
+
+            # Start processing in a background thread (so we can stream queue output)
+            t = threading.Thread(
+                target=self._process_segments_parallel,
+                args=(audio, speaker_segments),
+                daemon=True,
+            )
+            t.start()
+
+            captions_out = []
+            last_heartbeat = time.time()
+
+            # Stream segments as they become available in-order
+            while True:
+                # Error path
+                if self.error_occurred.is_set():
+                    msg = self.error_message or "Unknown error"
+                    yield {"type": "error", "message": msg}
+                    return
+
+                try:
+                    seg = self.playback_queue.get(timeout=0.5)
+                    self.playback_queue.task_done()
+
+                    # Update buffering progress based on ORIGINAL timeline end
+                    buffered_segments += 1
+                    buffered_until_ms = max(buffered_until_ms, int(seg.end_ms))
+
+                    # Emit buffering status occasionally until buffer is reached
+                    if buffered_until_ms < buffer_target_ms:
+                        yield {
+                            "type": "buffering",
+                            "buffered_until_sec": buffered_until_ms / 1000.0,
+                            "buffered_segments": buffered_segments,
+                            "buffer_target_sec": buffer_duration_sec,
+                        }
+
+                    caption = {
+                        "speaker": seg.speaker_id,
+                        "startTime": seg.start_ms / 1000.0,
+                        "endTime": seg.end_ms / 1000.0,
+                        "original": seg.original_text,
+                        "translated": seg.translated_text,
+                    }
+                    captions_out.append(caption)
+
+                    yield {"type": "segment", "caption": caption}
+
+                except queue.Empty:
+                    # Heartbeat so the client/proxy doesn't think the connection died
+                    now = time.time()
+                    if now - last_heartbeat >= heartbeat_sec:
+                        yield {
+                            "type": "heartbeat",
+                            "processing_complete": self.processing_complete.is_set(),
+                            "buffered_until_sec": buffered_until_ms / 1000.0,
+                        }
+                        last_heartbeat = now
+
+                    # Stop when processing is done and nothing left to emit
+                    if self.processing_complete.is_set():
+                        break
+
+            # Build final MP3 (same as non-stream path)
+            with self.segments_lock:
+                segments = list(self.all_segments)
+
+            final_audio = self._compose_audio(segments, total_duration_sec)
+            mp3_io = io.BytesIO()
+            final_audio.export(mp3_io, format="mp3")
+            mp3_bytes = mp3_io.getvalue()
+
+            import base64
+            yield {
+                "type": "final",
+                "audio_base64": base64.b64encode(mp3_bytes).decode("utf-8"),
+                "captions": captions_out,
+            }
+        finally:
+            self.batch_lock.release()
 
     def _assign_chunk_voices(
         self,
@@ -2207,14 +2223,19 @@ class DynamicSpeakerTranslator:
         audio_np = audio.squeeze().numpy()
 
         # ── Transcribe with Whisper VAD (single pass, no pyannote) ────────────
-        raw_segs, _ = self.whisper.transcribe(
+        whisper_lang = self.source_lang if self.source_lang != "auto" else None
+        raw_segs, whisper_info = self.whisper.transcribe(
             audio_np,
-            language=self.source_lang,
+            language=whisper_lang,
             beam_size=1,
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 300, "min_speech_duration_ms": 400},
             condition_on_previous_text=False,
         )
+
+        detected_lang = getattr(whisper_info, "language", None)
+        if detected_lang:
+            yield {"type": "language_detected", "language": detected_lang}
 
         speech_items = [
             (seg.start, seg.end, seg.text.strip())

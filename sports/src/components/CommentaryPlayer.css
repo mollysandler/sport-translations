@@ -230,3 +230,35 @@
     gap: 0.75rem;
   }
 }
+
+@media (max-width: 640px) {
+  .player-card {
+    padding: 1rem;
+  }
+
+  .download-buttons {
+    flex-direction: column;
+    width: 100%;
+  }
+
+  .download-button {
+    width: 100%;
+    text-align: center;
+  }
+
+  .commentary-box {
+    min-height: 120px;
+    padding: 1rem;
+  }
+
+  .player-controls {
+    gap: 0.5rem;
+    padding: 0.75rem;
+  }
+
+  .play-button {
+    width: 40px;
+    height: 40px;
+    font-size: 1.25rem;
+  }
+}

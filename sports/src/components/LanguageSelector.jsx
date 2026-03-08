@@ -3,6 +3,7 @@
 import "./LanguageSelector.css"
 
 const LANGUAGES = [
+  { code: "auto", name: "Auto-detect", flag: "🌐" },
   { code: "en", name: "English", flag: "🇬🇧" },
   { code: "es", name: "Spanish", flag: "🇪🇸" },
   { code: "fr", name: "French", flag: "🇫🇷" },
@@ -15,7 +16,7 @@ const LANGUAGES = [
   { code: "ar", name: "Arabic", flag: "🇸🇦" },
 ]
 
-export default function LanguageSelector({ sourceLanguage, targetLanguage, onSourceChange, onTargetChange }) {
+export default function LanguageSelector({ sourceLanguage, targetLanguage, onSourceChange, onTargetChange, detectedLanguage }) {
   const handleSwap = () => {
     const temp = sourceLanguage
     onSourceChange(targetLanguage)
@@ -40,11 +41,21 @@ export default function LanguageSelector({ sourceLanguage, targetLanguage, onSou
               </option>
             ))}
           </select>
+          {sourceLanguage === "auto" && detectedLanguage && (() => {
+            const detected = LANGUAGES.find((l) => l.code === detectedLanguage);
+            return (
+              <span className="detected-language-indicator">
+                Detected: {detected ? `${detected.flag} ${detected.name}` : detectedLanguage}
+              </span>
+            );
+          })()}
         </div>
 
-        <button onClick={handleSwap} className="swap-button" title="Swap languages">
-          ⇄
-        </button>
+        {sourceLanguage !== "auto" && (
+          <button onClick={handleSwap} className="swap-button" title="Swap languages">
+            ⇄
+          </button>
+        )}
 
         <div className="language-select-group">
           <label htmlFor="target-lang">To:</label>

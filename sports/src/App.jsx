@@ -4,17 +4,20 @@ import { useState, useRef, useCallback } from "react";
 import LanguageSelector from "./components/LanguageSelector";
 import AudioInput from "./components/AudioInput";
 import CommentaryPlayer from "./components/CommentaryPlayer";
+import { ToastProvider, useToast } from "./components/Toast";
 import "./App.css";
 
-export default function App() {
-  const [sourceLanguage, setSourceLanguage] = useState("en");
+function AppInner() {
+  const [sourceLanguage, setSourceLanguage] = useState("auto");
   const [targetLanguage, setTargetLanguage] = useState("hi");
   const [audioInput, setAudioInput] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [captions, setCaptions] = useState([]);
   const [isConnecting, setIsConnecting] = useState(false);
+  const [detectedLanguage, setDetectedLanguage] = useState(null);
 
   const audioSegmentsRef = useRef([]);
+  const showToast = useToast();
 
   const handleAudioSelected = (data) => {
     setAudioInput(data);
@@ -32,6 +35,17 @@ export default function App() {
   const handleConnectionStatusChange = useCallback((connecting) => {
     setIsConnecting(connecting);
   }, []);
+
+  const handleLanguageDetected = useCallback((langCode) => {
+    setDetectedLanguage(langCode);
+    const LANG_NAMES = {
+      en: "English", es: "Spanish", fr: "French", de: "German",
+      it: "Italian", pt: "Portuguese", hi: "Hindi", ja: "Japanese",
+      zh: "Chinese", ar: "Arabic",
+    };
+    const name = LANG_NAMES[langCode] || langCode;
+    showToast(`Detected language: ${name}`, "info");
+  }, [showToast]);
 
   const downloadSrt = useCallback(() => {
     if (captions.length === 0) return;
@@ -108,6 +122,7 @@ export default function App() {
           targetLanguage={targetLanguage}
           onSourceChange={setSourceLanguage}
           onTargetChange={setTargetLanguage}
+          detectedLanguage={detectedLanguage}
         />
 
         <AudioInput
@@ -116,7 +131,9 @@ export default function App() {
           onAudioSelected={handleAudioSelected}
           onLiveCaptionAdded={handleLiveCaptionAdded}
           onConnectionStatusChange={handleConnectionStatusChange}
+          onLanguageDetected={handleLanguageDetected}
           audioSegmentsRef={audioSegmentsRef}
+          showToast={showToast}
         />
 
         {audioInput && (
@@ -125,6 +142,7 @@ export default function App() {
             captions={captions}
             sourceLanguage={sourceLanguage}
             targetLanguage={targetLanguage}
+            detectedLanguage={detectedLanguage}
             isPlaying={isPlaying}
             onPlayingChange={setIsPlaying}
             isConnecting={isConnecting}
@@ -134,5 +152,13 @@ export default function App() {
         )}
       </main>
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <ToastProvider>
+      <AppInner />
+    </ToastProvider>
   );
 }

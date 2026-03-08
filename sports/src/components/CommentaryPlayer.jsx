@@ -8,6 +8,7 @@ export default function CommentaryPlayer({
   captions = [],
   sourceLanguage,
   targetLanguage,
+  detectedLanguage,
   isPlaying,
   onPlayingChange,
   isConnecting,
@@ -142,7 +143,7 @@ export default function CommentaryPlayer({
           style={isLive ? { maxHeight: 420, overflowY: "auto" } : {}}
         >
           <div className="commentary-section">
-            <h4>Original ({sourceLanguage.toUpperCase()})</h4>
+            <h4>Original ({(detectedLanguage || sourceLanguage).toUpperCase()})</h4>
             <div className="captions-list">
               {captionsToShow.length > 0 ? (
                 captionsToShow.map((cap, index) => (

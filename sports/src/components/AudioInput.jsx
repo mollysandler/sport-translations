@@ -69,9 +69,11 @@ export default function AudioInput({
   onAudioSelected,
   onLiveCaptionAdded,
   onConnectionStatusChange,
+  onLanguageDetected,
   audioSegmentsRef,
+  showToast,
 }) {
-  const [inputMethod, setInputMethod] = useState("upload");
+  const [inputMethod, setInputMethod] = useState("stream");
   const [streamUrl, setStreamUrl] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [liveStatus, setLiveStatus] = useState("idle"); // idle | connecting | streaming | stopping
@@ -90,6 +92,9 @@ export default function AudioInput({
   const streamAbortRef = useRef(null);    // AbortController for stream URL
   const sessionAbortRef = useRef(null);   // AbortController for /session/start
   const firstSegmentReceivedRef = useRef(false);
+  const canvasRef = useRef(null);
+  const analyserRef = useRef(null);
+  const animFrameRef = useRef(null);
 
   // -- Batch file upload (unchanged) ----------------------------------------
 
@@ -108,6 +113,11 @@ export default function AudioInput({
       if (!response.ok) throw new Error("Network response was not ok");
 
       const data = await response.json();
+
+      if (data.detected_language && onLanguageDetected) {
+        onLanguageDetected(data.detected_language);
+      }
+
       const binary = window.atob(data.audio_base64);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
@@ -123,7 +133,7 @@ export default function AudioInput({
       });
     } catch (error) {
       console.error("Error translating audio:", error);
-      alert("Failed to translate audio. See console for details.");
+      if (showToast) showToast("Failed to translate audio. See console for details.", "error");
     } finally {
       setIsLoading(false);
     }
@@ -202,7 +212,9 @@ export default function AudioInput({
       });
 
       for await (const item of readSseEvents(response)) {
-        if (item.type === "segment") {
+        if (item.type === "language_detected") {
+          if (onLanguageDetected) onLanguageDetected(item.language);
+        } else if (item.type === "segment") {
           // Transition from connecting -> streaming on first segment
           if (!firstSegmentReceivedRef.current) {
             firstSegmentReceivedRef.current = true;
@@ -335,7 +347,9 @@ export default function AudioInput({
     }
 
     for await (const item of readSseEvents(response)) {
-      if (item.type === "segment") {
+      if (item.type === "language_detected") {
+        if (onLanguageDetected) onLanguageDetected(item.language);
+      } else if (item.type === "segment") {
         // Transition from connecting -> streaming on first segment
         if (!firstSegmentReceivedRef.current) {
           firstSegmentReceivedRef.current = true;
@@ -349,6 +363,54 @@ export default function AudioInput({
       } else if (item.type === "error") {
         console.error("Live chunk error:", item.message);
       }
+    }
+  };
+
+  // -- Waveform visualizer ---------------------------------------------------
+
+  const startVisualizer = () => {
+    const canvas = canvasRef.current;
+    const analyser = analyserRef.current;
+    if (!canvas || !analyser) return;
+
+    const ctx = canvas.getContext("2d");
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+
+    const draw = () => {
+      animFrameRef.current = requestAnimationFrame(draw);
+      analyser.getByteFrequencyData(dataArray);
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const barWidth = (canvas.width / bufferLength) * 2.5;
+      let x = 0;
+      for (let i = 0; i < bufferLength; i++) {
+        const barHeight = (dataArray[i] / 255) * canvas.height;
+        const gradient = ctx.createLinearGradient(0, canvas.height, 0, canvas.height - barHeight);
+        gradient.addColorStop(0, "#3b82f6");
+        gradient.addColorStop(1, "#1e40af");
+        ctx.fillStyle = gradient;
+        ctx.fillRect(x, canvas.height - barHeight, barWidth - 1, barHeight);
+        x += barWidth;
+        if (x > canvas.width) break;
+      }
+    };
+    draw();
+  };
+
+  const stopVisualizer = () => {
+    if (animFrameRef.current) {
+      cancelAnimationFrame(animFrameRef.current);
+      animFrameRef.current = null;
+    }
+    if (analyserRef.current) {
+      analyserRef.current.disconnect();
+      analyserRef.current = null;
+    }
+    const canvas = canvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
     }
   };
 
@@ -425,6 +487,12 @@ export default function AudioInput({
     const sourceNode = captureCtx.createMediaStreamSource(stream);
     sourceNodeRef.current = sourceNode;
 
+    // Analyser for waveform visualization
+    const analyser = captureCtx.createAnalyser();
+    analyser.fftSize = 256;
+    analyserRef.current = analyser;
+    sourceNode.connect(analyser);
+
     const processor = captureCtx.createScriptProcessor(4096, 1, 1);
     processorRef.current = processor;
 
@@ -443,16 +511,20 @@ export default function AudioInput({
       }
     };
 
-    sourceNode.connect(processor);
+    analyser.connect(processor);
     const muteGain = captureCtx.createGain();
     muteGain.gain.value = 0;
     processor.connect(muteGain);
     muteGain.connect(captureCtx.destination);
+
+    // Start waveform visualizer
+    startVisualizer();
   };
 
   const handleStopLive = async () => {
     setLiveStatus("stopping");
     if (onConnectionStatusChange) onConnectionStatusChange(false);
+    stopVisualizer();
 
     // Abort session start if still in progress
     if (sessionAbortRef.current) {
@@ -532,7 +604,7 @@ export default function AudioInput({
             <div className="upload-section">
               <label htmlFor="audio-file" className="file-input-label">
                 <span className="upload-icon">📤</span>
-                <span>Click to upload or drag and drop</span>
+                <span>Click to upload a file</span>
                 <span className="upload-hint">MP3, WAV, M4A (Max 500MB)</span>
               </label>
               <input
@@ -621,6 +693,7 @@ export default function AudioInput({
                   <p className="connecting-hint">
                     This may take 30-60s on first request while the GPU warms up
                   </p>
+                  <canvas ref={canvasRef} className="waveform-canvas" width={300} height={60} />
                   <button onClick={handleStopLive} className="record-button stop">
                     Cancel
                   </button>
@@ -631,6 +704,7 @@ export default function AudioInput({
                     <span className="recording-dot"></span>
                     Live — translating every 8s...
                   </div>
+                  <canvas ref={canvasRef} className="waveform-canvas" width={300} height={60} />
                   <button
                     onClick={handleStopLive}
                     className="record-button stop"

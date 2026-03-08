@@ -93,13 +93,17 @@ def make_app(service: Any) -> FastAPI:
         wav_bytes = wav_bytes_16k_mono(audio)
 
         if _running_on_modal():
-            mp3_bytes, captions = service.translate_wav_bytes_local(wav_bytes, source_lang, target_lang)
+            result = service.translate_wav_bytes_local(wav_bytes, source_lang, target_lang)
         else:
-            mp3_bytes, captions = service.translate_wav_bytes.remote(wav_bytes, source_lang, target_lang)
+            result = service.translate_wav_bytes.remote(wav_bytes, source_lang, target_lang)
+
+        mp3_bytes, captions = result[0], result[1]
+        detected_language = result[2] if len(result) > 2 else None
 
         return {
             "audio_base64": base64.b64encode(mp3_bytes).decode("utf-8"),
             "captions": captions,
+            "detected_language": detected_language,
         }
 
     @app.post("/session/start")

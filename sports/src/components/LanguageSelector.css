@@ -76,6 +76,13 @@
   transform: scale(0.95);
 }
 
+.detected-language-indicator {
+  font-size: 0.8rem;
+  color: #2563eb;
+  margin-top: 0.25rem;
+  display: block;
+}
+
 @media (max-width: 640px) {
   .language-controls {
     flex-direction: column;
