@@ -1991,6 +1991,20 @@ class DynamicSpeakerTranslator:
         finally:
             self.batch_lock.release()
 
+    def _extract_speaker_embedding(self, audio_tensor: torch.Tensor) -> Optional[np.ndarray]:
+        """Extract ECAPA-TDNN speaker embedding from audio tensor [1, N]."""
+        try:
+            self.diarizer._load_spkrec()
+            if self.diarizer._spkrec is None:
+                return None
+            wav = audio_tensor.to(self.diarizer._spkrec_device).float()
+            with torch.no_grad():
+                emb = self.diarizer._spkrec.encode_batch(wav)
+            return emb.squeeze(0).squeeze(0).detach().cpu().numpy()
+        except Exception as e:
+            print(f"   ⚠️  Embedding extraction failed: {e}")
+            return None
+
     def _assign_chunk_voices(
         self,
         audio: torch.Tensor,
@@ -1999,23 +2013,40 @@ class DynamicSpeakerTranslator:
         session_state: dict,
     ) -> Dict[str, str]:
         """
-        Assign (or reuse from session) voice IDs for speakers in this chunk.
+        Assign (or reuse) voice IDs for speakers in this chunk.
 
-        Cross-chunk continuity: match detected speakers to session speakers by pitch
-        proximity. If within 30 Hz → reuse that session speaker's voice.
-        Otherwise assign a fresh voice via voice_manager._match_best_voice.
+        Uses hybrid dominance + two-pass assignment (v7c strategy):
+          - Single-speaker chunks: normal embedding + pitch matching
+          - Multi-speaker chunks: dominant speaker assigned first, then
+            secondary speakers with dominant voice exclusion + history bias
 
-        Mutates session_state["speaker_voice_ids"] and session_state["speaker_pitches"].
+        Mutates session_state["speaker_voice_ids"], ["speaker_pitches"],
+        ["speaker_pitch_histories"], ["speaker_embeddings"], and ["diar_history"].
         Returns {chunk_local_speaker_id: voice_id}.
         """
+        from collections import Counter
+
+        EMB_THRESHOLD = 0.40
+        EMB_MARGIN = 0.03
+        SECONDARY_EMB_THRESHOLD = 0.25
+        HISTORY_BONUS = 0.10
+        DURATION_RATIO_THRESHOLD = 2.0
         PITCH_MATCH_HZ = 30.0
+
         unique_speakers = sorted(set(seg.speaker_id for seg in segments))
         chunk_voice_map: Dict[str, str] = {}
 
+        session_embeddings = session_state.setdefault("speaker_embeddings", {})
+        pitch_histories = session_state.setdefault("speaker_pitch_histories", {})
+        diar_history = session_state.setdefault("diar_history", {})
+
+        # ------------------------------------------------------------------
+        # Phase 1: Extract audio, pitch, embedding for each speaker
+        # ------------------------------------------------------------------
+        speaker_data: Dict[str, dict] = {}
         for speaker_id in unique_speakers:
             speaker_segs = [s for s in segments if s.speaker_id == speaker_id]
 
-            # Collect ≥0.5s of audio for pitch analysis
             collected = []
             total_dur = 0.0
             for seg in speaker_segs:
@@ -2030,7 +2061,6 @@ class DynamicSpeakerTranslator:
                     break
 
             if not collected or total_dur < 0.5:
-                # Not enough audio — reuse any existing session voice or default
                 if session_state["speaker_voice_ids"]:
                     fallback = next(iter(session_state["speaker_voice_ids"].values()))
                 else:
@@ -2043,35 +2073,181 @@ class DynamicSpeakerTranslator:
 
             try:
                 try:
-                    audio_np = librosa.effects.preemphasis(audio_np)
+                    audio_np_pre = librosa.effects.preemphasis(audio_np)
                 except Exception:
-                    pass
-                avg_pitch, pitch_range = _estimate_pitch_safe(audio_np, sr)
+                    audio_np_pre = audio_np
+                avg_pitch, pitch_range = _estimate_pitch_safe(audio_np_pre, sr)
                 gender = gender_from_pitch(avg_pitch, pitch_range)
             except Exception:
                 avg_pitch, pitch_range, gender = 150.0, 20.0, "male"
 
-            # Try to match to an existing session speaker by pitch
-            session_pitches = session_state["speaker_pitches"]
-            best_session_spk = None
-            best_dist = float("inf")
-            for session_spk, session_pitch in session_pitches.items():
-                dist = abs(avg_pitch - session_pitch)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_session_spk = session_spk
+            chunk_embedding = self._extract_speaker_embedding(combined)
 
-            if best_session_spk is not None and best_dist <= PITCH_MATCH_HZ:
-                voice_id = session_state["speaker_voice_ids"][best_session_spk]
-                print(f"   ♻️  {speaker_id}: pitch={avg_pitch:.0f}Hz → reusing {best_session_spk} voice (dist={best_dist:.0f}Hz)")
+            speaker_data[speaker_id] = {
+                "avg_pitch": avg_pitch,
+                "pitch_range": pitch_range,
+                "gender": gender,
+                "embedding": chunk_embedding,
+                "seg_count": len(speaker_segs),
+                "seg_duration": sum(s.end_sec - s.start_sec for s in speaker_segs),
+            }
+
+        speakers_with_data = [spk for spk in unique_speakers if spk in speaker_data]
+        if not speakers_with_data:
+            return chunk_voice_map
+
+        is_multi_speaker = len(speakers_with_data) >= 2
+
+        # ------------------------------------------------------------------
+        # Helpers
+        # ------------------------------------------------------------------
+        def _match_embedding(emb, exclude_voice=None, history_pref=None):
+            """Embedding match; optionally exclude a voice and apply history bias."""
+            if emb is None or not session_embeddings:
+                return None, 0.0
+            from diarizer import _cosine_sim
+            candidates = {k: _cosine_sim(emb, v)
+                          for k, v in session_embeddings.items()
+                          if k != exclude_voice}
+            if not candidates:
+                return None, 0.0
+
+            if exclude_voice is not None:
+                # Secondary matching — lower threshold + history bonus
+                boosted = {}
+                for k, sim in candidates.items():
+                    bonus = HISTORY_BONUS if k == history_pref else 0.0
+                    boosted[k] = sim + bonus
+                best_k = max(boosted, key=boosted.get)
+                raw_sim = candidates[best_k]
+                if boosted[best_k] >= SECONDARY_EMB_THRESHOLD:
+                    return best_k, raw_sim
             else:
-                voice_id = self.voice_manager._match_best_voice(gender, avg_pitch, pitch_range)
-                # Register as a new session speaker
-                session_state["speaker_voice_ids"][speaker_id] = voice_id
-                session_state["speaker_pitches"][speaker_id] = avg_pitch
-                print(f"   🆕  {speaker_id}: pitch={avg_pitch:.0f}Hz → new voice {voice_id[:8]}...")
+                # Normal matching — standard threshold + margin
+                sorted_sims = sorted(candidates.items(), key=lambda kv: kv[1], reverse=True)
+                best_k, best_sim = sorted_sims[0]
+                second_sim = sorted_sims[1][1] if len(sorted_sims) > 1 else 0.0
+                if best_sim >= EMB_THRESHOLD and (best_sim - second_sim) >= EMB_MARGIN:
+                    return best_k, best_sim
+
+            return None, 0.0
+
+        def _match_pitch(pitch, exclude_voice=None):
+            """Pitch proximity match; optionally exclude a voice."""
+            best_dist = float("inf")
+            best_spk = None
+            for session_spk, anchor_pitch in session_state["speaker_pitches"].items():
+                if session_spk == exclude_voice:
+                    continue
+                dist = abs(pitch - anchor_pitch)
+                if dist <= PITCH_MATCH_HZ and dist < best_dist:
+                    best_dist = dist
+                    best_spk = session_spk
+            return best_spk, best_dist
+
+        def _apply_match(speaker_id, data, session_spk):
+            """Apply a match or create a new voice.  Returns the session key."""
+            if session_spk is not None:
+                voice_id = session_state["speaker_voice_ids"][session_spk]
+                hist = pitch_histories.setdefault(
+                    session_spk, [session_state["speaker_pitches"][session_spk]])
+                hist.append(data["avg_pitch"])
+                if len(hist) > 6:
+                    pitch_histories[session_spk] = hist[-6:]
+                if data["embedding"] is not None and session_spk in session_embeddings:
+                    old = session_embeddings[session_spk]
+                    session_embeddings[session_spk] = 0.7 * old + 0.3 * data["embedding"]
+            else:
+                voice_id = self.voice_manager._match_best_voice(
+                    data["gender"], data["avg_pitch"], data["pitch_range"])
+                next_id = session_state.setdefault("_next_spk_id", 0)
+                session_spk = f"SPK_{next_id}"
+                session_state["_next_spk_id"] = next_id + 1
+                session_state["speaker_voice_ids"][session_spk] = voice_id
+                session_state["speaker_pitches"][session_spk] = data["avg_pitch"]
+                pitch_histories[session_spk] = [data["avg_pitch"]]
+                if data["embedding"] is not None:
+                    session_embeddings[session_spk] = data["embedding"]
+                print(f"   🆕  {speaker_id}: pitch={data['avg_pitch']:.0f}Hz → "
+                      f"new voice {voice_id[:8]}...")
 
             chunk_voice_map[speaker_id] = voice_id
+            hist_counter = diar_history.setdefault(speaker_id, Counter())
+            hist_counter[session_spk] += 1
+            return session_spk
+
+        # ------------------------------------------------------------------
+        # Phase 2: Assign voices
+        # ------------------------------------------------------------------
+        if not is_multi_speaker:
+            # Single-speaker chunk — normal matching
+            for speaker_id in speakers_with_data:
+                data = speaker_data[speaker_id]
+                session_spk, sim = _match_embedding(data["embedding"])
+                if session_spk:
+                    print(f"   ♻️  {speaker_id}: pitch={data['avg_pitch']:.0f}Hz → "
+                          f"embedding match to {session_spk} (sim={sim:.3f})")
+                else:
+                    session_spk, dist = _match_pitch(data["avg_pitch"])
+                    if session_spk:
+                        print(f"   ♻️  {speaker_id}: pitch={data['avg_pitch']:.0f}Hz → "
+                              f"pitch match to {session_spk} (dist={dist:.0f}Hz)")
+                _apply_match(speaker_id, data, session_spk)
+        else:
+            # Multi-speaker chunk — hybrid dominance + two-pass
+            spk_list = list(speakers_with_data)
+            if len(spk_list) == 2:
+                a, b = spk_list
+                dur_a = speaker_data[a]["seg_duration"]
+                dur_b = speaker_data[b]["seg_duration"]
+                ratio = max(dur_a, dur_b) / max(min(dur_a, dur_b), 0.01)
+                if ratio >= DURATION_RATIO_THRESHOLD:
+                    dominant_diar = a if dur_a >= dur_b else b
+                else:
+                    count_a = speaker_data[a]["seg_count"]
+                    count_b = speaker_data[b]["seg_count"]
+                    dominant_diar = a if count_a >= count_b else b
+            else:
+                dominant_diar = max(spk_list, key=lambda s: speaker_data[s]["seg_count"])
+
+            secondary_spks = [s for s in spk_list if s != dominant_diar]
+
+            # Pass 1: dominant speaker (normal matching)
+            dom_data = speaker_data[dominant_diar]
+            dom_spk, dom_sim = _match_embedding(dom_data["embedding"])
+            if dom_spk:
+                print(f"   ♻️  {dominant_diar}: pitch={dom_data['avg_pitch']:.0f}Hz → "
+                      f"embedding match to {dom_spk} (sim={dom_sim:.3f}) [dominant]")
+            else:
+                dom_spk, dom_dist = _match_pitch(dom_data["avg_pitch"])
+                if dom_spk:
+                    print(f"   ♻️  {dominant_diar}: pitch={dom_data['avg_pitch']:.0f}Hz → "
+                          f"pitch match to {dom_spk} (dist={dom_dist:.0f}Hz) [dominant]")
+            dominant_voice = _apply_match(dominant_diar, dom_data, dom_spk)
+
+            # Pass 2: secondary speakers (exclude dominant voice + history bias)
+            for speaker_id in secondary_spks:
+                data = speaker_data[speaker_id]
+                hist = diar_history.get(speaker_id, Counter())
+                hist_pref = hist.most_common(1)[0][0] if hist else None
+
+                sec_spk, sec_sim = _match_embedding(
+                    data["embedding"],
+                    exclude_voice=dominant_voice,
+                    history_pref=hist_pref,
+                )
+                if sec_spk:
+                    bonus_str = "+hist" if sec_spk == hist_pref else ""
+                    print(f"   ♻️  {speaker_id}: pitch={data['avg_pitch']:.0f}Hz → "
+                          f"secondary match to {sec_spk} "
+                          f"(sim={sec_sim:.3f}{bonus_str})")
+                else:
+                    sec_spk, sec_dist = _match_pitch(
+                        data["avg_pitch"], exclude_voice=dominant_voice)
+                    if sec_spk:
+                        print(f"   ♻️  {speaker_id}: pitch={data['avg_pitch']:.0f}Hz → "
+                              f"secondary pitch match to {sec_spk} (dist={sec_dist:.0f}Hz)")
+                _apply_match(speaker_id, data, sec_spk)
 
         return chunk_voice_map
 

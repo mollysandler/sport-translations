@@ -668,6 +668,8 @@ export default function AudioInput({
                       { label: "BBC News (EN)", url: "https://stream.live.vc.bbcmedia.co.uk/bbc_world_service" },
                       { label: "France Info (FR)", url: "https://stream.radiofrance.fr/franceinfo/franceinfo_hifi.m3u8" },
                       { label: "Deutsche Welle (DE)", url: "https://rbmn-live.akamaized.net/hls/live/590198/dwstream5/index.m3u8" },
+                      { label: "BBC 5 Live Sports (EN)", url: "http://a.files.bbci.co.uk/media/live/manifesto/audio/simulcast/hls/uk/sbr_high/ak/bbc_radio_five_live.m3u8" },
+                      { label: "BBC 5 Sports Extra (EN)", url: "http://a.files.bbci.co.uk/media/live/manifesto/audio/simulcast/hls/uk/sbr_high/ak/bbc_radio_five_live_sports_extra.m3u8" },
                     ].map((s) => (
                       <button
                         key={s.url}
