@@ -1400,7 +1400,11 @@ class DynamicSpeakerTranslator:
             # 3) Translate
             # ----------------------------
             if not self.use_local_translation:
-                translated_text = self.translator.translate(original_text)
+                # Per-call instance — GoogleTranslator is not thread-safe
+                from deep_translator import GoogleTranslator
+                translated_text = GoogleTranslator(
+                    source=self.source_lang, target=self.target_lang
+                ).translate(original_text)
             else:
                 tokens = self.tokenizer([original_text], return_tensors="pt", padding=True)
                 translated = self.translation_model.generate(**tokens)
@@ -2435,7 +2439,11 @@ class DynamicSpeakerTranslator:
 
         def _translate_and_tts(start_sec, end_sec, original_text, voice_id):
             if not self.use_local_translation:
-                translated = self.translator.translate(original_text)
+                # Create per-call translator — GoogleTranslator is not thread-safe
+                from deep_translator import GoogleTranslator
+                translated = GoogleTranslator(
+                    source=self.source_lang, target=self.target_lang
+                ).translate(original_text)
             else:
                 tokens = self.tokenizer([original_text], return_tensors="pt", padding=True)
                 out = self.translation_model.generate(**tokens)
