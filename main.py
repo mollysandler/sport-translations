@@ -562,7 +562,7 @@ class DynamicSpeakerTranslator:
         use_voice_cloning: bool = False,
         tts_config: Optional[TTSConfig] = None,
         speaker_merge: Optional[SpeakerMergeConfig] = None,
-        qwen_cloner=None, 
+        qwen_cloner=None,
         xtts_cloner=None,
     ):
         self.source_lang = source_lang
@@ -2333,6 +2333,7 @@ class DynamicSpeakerTranslator:
         Returns a list of (speaker_id, voice_id) parallel to speech_items.
         """
         PITCH_MATCH_HZ = 30.0
+        MIN_PITCH_DURATION = 0.8  # seconds — shorter segments inherit last speaker
         results = []
 
         for start_sec, end_sec, _ in speech_items:
@@ -2340,6 +2341,15 @@ class DynamicSpeakerTranslator:
             end_s = int(end_sec * sr)
             seg_audio = audio[:, start_s:end_s]
             dur = (end_s - start_s) / sr
+
+            # Short segments: inherit last speaker to avoid phantom switches
+            if dur < MIN_PITCH_DURATION:
+                last_spk = session_state.get("last_speaker_id")
+                if last_spk and last_spk in session_state["speaker_voice_ids"]:
+                    print(f"   ⏩  [{start_sec:.1f}-{end_sec:.1f}s] short ({dur:.1f}s) → inherit {last_spk}")
+                    results.append((last_spk, session_state["speaker_voice_ids"][last_spk]))
+                    continue
+                # No history yet — fall through to normal matching
 
             avg_pitch, pitch_range, gender = 150.0, 20.0, "male"
             if dur >= 0.3:
@@ -2363,7 +2373,11 @@ class DynamicSpeakerTranslator:
                     best_spk = spk
 
             if best_spk and best_dist <= PITCH_MATCH_HZ:
+                # EMA pitch smoothing: update stored pitch towards new observation
+                old_pitch = session_state["speaker_pitches"][best_spk]
+                session_state["speaker_pitches"][best_spk] = 0.7 * old_pitch + 0.3 * avg_pitch
                 print(f"   ♻️  [{start_sec:.1f}-{end_sec:.1f}s] pitch={avg_pitch:.0f}Hz → {best_spk} (Δ{best_dist:.0f}Hz)")
+                session_state["last_speaker_id"] = best_spk
                 results.append((best_spk, session_state["speaker_voice_ids"][best_spk]))
             else:
                 voice_id = self.voice_manager._match_best_voice(gender, avg_pitch, pitch_range)
@@ -2371,6 +2385,7 @@ class DynamicSpeakerTranslator:
                 session_state["speaker_voice_ids"][spk_id] = voice_id
                 session_state["speaker_pitches"][spk_id] = avg_pitch
                 print(f"   🆕  [{start_sec:.1f}-{end_sec:.1f}s] pitch={avg_pitch:.0f}Hz → new {spk_id}")
+                session_state["last_speaker_id"] = spk_id
                 results.append((spk_id, voice_id))
 
         return results
@@ -2379,6 +2394,7 @@ class DynamicSpeakerTranslator:
         self,
         wav_bytes: bytes,
         session_state: dict,
+        overlap_duration_sec: float = 0.0,
     ):
         """
         Fast live-streaming path: uses Whisper's built-in VAD directly.
@@ -2423,9 +2439,21 @@ class DynamicSpeakerTranslator:
             if seg.text and seg.text.strip() and (seg.end - seg.start) >= 0.3
         ]
 
+        # ── Dedup segments in the overlap region ─────────────────────────
+        if overlap_duration_sec > 0 and speech_items:
+            deduped = []
+            for start, end, text in speech_items:
+                # Drop any segment that starts within the overlap zone —
+                # the previous chunk already covered this audio.
+                if start < overlap_duration_sec - 0.1:
+                    print(f"   🗑️  Overlap dedup: dropping [{start:.1f}-{end:.1f}s] (starts in overlap)")
+                    continue
+                deduped.append((start, end, text))
+            speech_items = deduped
+
         if not speech_items:
             print(f"   ℹ️  Live chunk {chunk_duration_ms}ms: no speech detected by Whisper VAD")
-            session_state["chunk_offset_ms"] = chunk_offset_ms + chunk_duration_ms
+            session_state["chunk_offset_ms"] = chunk_offset_ms + chunk_duration_ms - int(overlap_duration_sec * 1000)
             return
 
         print(f"   ✅ Live chunk {chunk_duration_ms}ms: {len(speech_items)} Whisper segment(s)")
@@ -2494,7 +2522,28 @@ class DynamicSpeakerTranslator:
                     "progress": {"completed": completed_count, "total": total},
                 }
 
-        session_state["chunk_offset_ms"] = chunk_offset_ms + chunk_duration_ms
+        # Store last segment text for next-chunk dedup
+        if speech_items:
+            session_state["last_segment_text"] = speech_items[-1][2]
+
+        # Advance offset by new audio only (exclude overlap)
+        session_state["chunk_offset_ms"] = chunk_offset_ms + chunk_duration_ms - int(overlap_duration_sec * 1000)
+
+
+def _text_similarity(a: str, b: str) -> float:
+    """Word-level Jaccard similarity; substring fallback for very short texts."""
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if len(words_a) < 3 or len(words_b) < 3:
+        # For very short texts, use substring containment
+        la, lb = a.lower().strip(), b.lower().strip()
+        if la in lb or lb in la:
+            return 1.0
+        return 0.0
+    union = words_a | words_b
+    if not union:
+        return 0.0
+    return len(words_a & words_b) / len(union)
 
 
 def _build_arg_parser():

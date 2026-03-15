@@ -138,13 +138,13 @@ class TranslatorService:
     def delete_session(self, session_id: str):
         self._sessions.pop(session_id, None)
 
-    def process_live_chunk(self, wav_bytes: bytes, session_id: str, source_lang: str, target_lang: str):
+    def process_live_chunk(self, wav_bytes: bytes, session_id: str, source_lang: str, target_lang: str, overlap_duration_sec: float = 0.0):
         session = self._sessions.get(session_id)
         if session is None:
             session = {"speaker_voice_ids": {}, "speaker_pitches": {}, "chunk_offset_ms": 0}
             self._sessions[session_id or "default"] = session
         translator = self._get_translator(source_lang, target_lang)
-        yield from translator.translate_chunk_stream(wav_bytes, session)
+        yield from translator.translate_chunk_stream(wav_bytes, session, overlap_duration_sec=overlap_duration_sec)
 
     @modal.asgi_app()
     def fastapi_app(self):
