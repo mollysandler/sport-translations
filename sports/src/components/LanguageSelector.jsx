@@ -67,7 +67,7 @@ export default function LanguageSelector({ sourceLanguage, targetLanguage, onSou
             onChange={(e) => onTargetChange(e.target.value)}
             className="language-dropdown"
           >
-            {LANGUAGES.map((lang) => (
+            {LANGUAGES.filter((lang) => lang.code !== "auto").map((lang) => (
               <option key={lang.code} value={lang.code}>
                 {lang.flag} {lang.name}
               </option>

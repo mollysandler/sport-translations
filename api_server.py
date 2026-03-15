@@ -20,19 +20,20 @@ def wav_bytes_16k_mono(upload: UploadFile) -> bytes:
     return out.getvalue()
 
 
-def stream_chunks_from_url(url: str, chunk_seconds: int = 8):
-    """Yield WAV bytes chunks from a URL using ffmpeg piped output.
+def stream_chunks_from_url(url: str, chunk_seconds: int = 15, overlap_seconds: float = 3.0):
+    """Yield (WAV bytes, overlap_duration_sec) from a URL using ffmpeg.
 
-    ffmpeg streams audio from the URL and pipes raw PCM to stdout.
-    We read chunk_seconds worth of samples at a time, wrap in a WAV
-    header, and yield. Generator stops when ffmpeg ends (stream over)
-    or on error.
+    Each chunk is ``chunk_seconds`` long.  The last ``overlap_seconds``
+    of PCM from the previous chunk is prepended to the next one so that
+    Whisper gets full sentence context at chunk boundaries.  The first
+    chunk has ``overlap_duration_sec=0.0``.
     """
     import struct
 
     sample_rate = 16000
     samples_per_chunk = sample_rate * chunk_seconds
     bytes_per_chunk = samples_per_chunk * 2  # 16-bit mono
+    overlap_bytes = int(sample_rate * overlap_seconds) * 2
 
     cmd = [
         "ffmpeg",
@@ -45,15 +46,26 @@ def stream_chunks_from_url(url: str, chunk_seconds: int = 8):
     ]
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    trailing_buffer = b""
     try:
         while True:
             raw = proc.stdout.read(bytes_per_chunk)
             if not raw or len(raw) < sample_rate * 2:
-                # Less than 1 second of audio — stream ended or too short
                 break
 
-            # Wrap raw PCM in a WAV header
-            data_len = len(raw)
+            # Prepend trailing audio from previous chunk for overlap
+            if trailing_buffer:
+                combined = trailing_buffer + raw
+                overlap_sec = overlap_seconds
+            else:
+                combined = raw
+                overlap_sec = 0.0
+
+            # Save trailing portion for next iteration
+            trailing_buffer = raw[-overlap_bytes:] if len(raw) >= overlap_bytes else raw
+
+            # Wrap combined PCM in a WAV header
+            data_len = len(combined)
             header = struct.pack(
                 "<4sI4s4sIHHIIHH4sI",
                 b"RIFF", 36 + data_len, b"WAVE",
@@ -61,7 +73,7 @@ def stream_chunks_from_url(url: str, chunk_seconds: int = 8):
                 sample_rate, sample_rate * 2, 2, 16,
                 b"data", data_len,
             )
-            yield header + raw
+            yield (header + combined, overlap_sec)
     finally:
         proc.stdout.close()
         proc.terminate()
@@ -124,9 +136,9 @@ def make_app(service: Any) -> FastAPI:
     ):
         def event_stream():
             try:
-                for wav_chunk in stream_chunks_from_url(url):
+                for wav_chunk, overlap_sec in stream_chunks_from_url(url):
                     try:
-                        for item in service.process_live_chunk(wav_chunk, session_id, source_lang, target_lang):
+                        for item in service.process_live_chunk(wav_chunk, session_id, source_lang, target_lang, overlap_duration_sec=overlap_sec):
                             yield f"data: {json.dumps(item)}\n\n"
                     except Exception as e:
                         yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
@@ -139,6 +151,29 @@ def make_app(service: Any) -> FastAPI:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    @app.post("/feedback")
+    def submit_feedback(
+        rating: int = Form(0),
+        feedbackType: str = Form("general"),
+        comments: str = Form(""),
+        sourceLanguage: str = Form(""),
+        targetLanguage: str = Form(""),
+        audioName: str = Form(""),
+    ):
+        try:
+            service.store_feedback({
+                "rating": rating,
+                "feedbackType": feedbackType,
+                "comments": comments,
+                "sourceLanguage": sourceLanguage,
+                "targetLanguage": targetLanguage,
+                "audioName": audioName,
+            })
+            return {"ok": True}
+        except Exception as e:
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=str(e))
 
     @app.post("/translate-live")
     def translate_live(

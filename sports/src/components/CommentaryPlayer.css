@@ -191,6 +191,38 @@
   text-transform: uppercase;
 }
 
+.play-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #374151;
+  min-width: 50px;
+}
+
+.paused-indicator {
+  font-size: 0.8rem;
+  color: #d97706;
+  font-weight: 500;
+  margin-left: auto;
+}
+
+
+.keyboard-hints {
+  display: flex;
+  gap: 1rem;
+  justify-content: center;
+  padding-top: 0.75rem;
+  border-top: 1px solid #eee;
+  margin-top: 0.5rem;
+}
+
+.keyboard-hints span {
+  font-size: 0.7rem;
+  color: #9ca3af;
+  background: #f3f4f6;
+  padding: 0.15rem 0.5rem;
+  border-radius: 3px;
+}
+
 .caption-item p {
   font-size: 1rem;
   line-height: 1.5;

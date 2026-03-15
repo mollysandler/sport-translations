@@ -14,6 +14,9 @@ export default function CommentaryPlayer({
   isConnecting,
   onDownloadSrt,
   onDownloadAudio,
+  speakerNames,
+  livePaused,
+  onLivePauseChange,
 }) {
   const audioRef = useRef(null);
   const scrollRef = useRef(null);
@@ -22,16 +25,18 @@ export default function CommentaryPlayer({
   const [duration, setDuration] = useState(0);
 
   const isLive = audioInput.type === "live";
+  const isRestored = audioInput.type === "restored";
+  const isScrollable = isLive || isRestored;
 
   useEffect(() => {
-    if (!isLive) return;
+    if (!isScrollable) return;
     const el = scrollRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-  }, [isLive, captions.length]);
+  }, [isScrollable, captions.length]);
 
   useEffect(() => {
-    if (isLive) return;
+    if (isScrollable) return;
 
     const audio = audioRef.current;
     if (!audio) return;
@@ -52,17 +57,21 @@ export default function CommentaryPlayer({
       audio.removeEventListener("timeupdate", handleTimeUpdate);
       audio.removeEventListener("loadedmetadata", handleLoadedMetadata);
     };
-  }, [isLive, onPlayingChange]);
+  }, [isScrollable, onPlayingChange]);
 
   const togglePlay = () => {
-    if (isLive) return;
+    if (isRestored) return;
+    if (isLive) {
+      onLivePauseChange?.(!livePaused);
+      return;
+    }
     const a = audioRef.current;
     if (!a) return;
     isPlaying ? a.pause() : a.play();
   };
 
   const handleProgressChange = (e) => {
-    if (isLive) return;
+    if (isScrollable) return;
     const a = audioRef.current;
     if (!a) return;
     a.currentTime = Number.parseFloat(e.target.value);
@@ -81,12 +90,19 @@ export default function CommentaryPlayer({
     return colors[num % colors.length];
   };
 
+  const getDisplayName = (speaker) => {
+    return (speakerNames && speakerNames[speaker]) || speaker;
+  };
+
   const captionsToShow = useMemo(() => {
-    if (isLive) return captions;
+    if (isScrollable) return captions;
     return captions.filter(
       (c) => currentTime >= c.startTime && currentTime <= c.endTime,
     );
-  }, [isLive, captions, currentTime]);
+  }, [isScrollable, captions, currentTime]);
+
+  const livePlayLabel = livePaused ? "Resume" : "Pause";
+  const batchPlayLabel = isPlaying ? "Pause" : "Play";
 
   return (
     <div className="player-card">
@@ -97,42 +113,59 @@ export default function CommentaryPlayer({
             {audioInput.type === "file" && "Uploaded File"}
             {audioInput.type === "stream" && "Stream"}
             {audioInput.type === "live" && "Live Translation"}
+            {audioInput.type === "restored" && "Saved Session"}
           </p>
         </div>
         {captions.length > 0 && (
           <div className="download-buttons">
-            <button className="download-button" onClick={onDownloadSrt}>
+            <button className="download-button" onClick={onDownloadSrt} title="Keyboard: S">
               Download SRT
             </button>
-            <button className="download-button" onClick={onDownloadAudio}>
-              Download Audio
-            </button>
+            {!isRestored && (
+              <button className="download-button" onClick={onDownloadAudio} title="Keyboard: D">
+                Download Audio
+              </button>
+            )}
           </div>
         )}
       </div>
 
-      {!isLive && <audio ref={audioRef} src={audioInput.source} />}
+      {!isScrollable && audioInput.source && (
+        <audio ref={audioRef} src={audioInput.source} />
+      )}
 
-      {!isLive && (
+      {/* Play/Pause controls — shown for batch and live, not restored */}
+      {!isRestored && (
         <div className="player-controls">
-          <button onClick={togglePlay} className="play-button">
-            {isPlaying ? "||" : ">"}
+          <button onClick={togglePlay} className="play-button" title="Keyboard: Space">
+            {isLive
+              ? (livePaused ? "\u25B6" : "\u23F8")
+              : (isPlaying ? "\u23F8" : "\u25B6")}
           </button>
+          <span className="play-label">
+            {isLive ? livePlayLabel : batchPlayLabel}
+          </span>
 
-          <div className="progress-container">
-            <input
-              type="range"
-              min="0"
-              max={duration || 0}
-              value={currentTime}
-              onChange={handleProgressChange}
-              className="progress-slider"
-            />
-            <div className="time-display">
-              <span>{formatTime(currentTime)}</span>
-              <span>{formatTime(duration)}</span>
+          {!isLive && (
+            <div className="progress-container">
+              <input
+                type="range"
+                min="0"
+                max={duration || 0}
+                value={currentTime}
+                onChange={handleProgressChange}
+                className="progress-slider"
+              />
+              <div className="time-display">
+                <span>{formatTime(currentTime)}</span>
+                <span>{formatTime(duration)}</span>
+              </div>
             </div>
-          </div>
+          )}
+
+          {isLive && livePaused && (
+            <span className="paused-indicator">Audio paused</span>
+          )}
         </div>
       )}
 
@@ -140,7 +173,7 @@ export default function CommentaryPlayer({
         <div
           className="commentary-box"
           ref={scrollRef}
-          style={isLive ? { maxHeight: 420, overflowY: "auto" } : {}}
+          style={isScrollable ? { maxHeight: 420, overflowY: "auto" } : {}}
         >
           <div className="commentary-section">
             <h4>Original ({(detectedLanguage || sourceLanguage).toUpperCase()})</h4>
@@ -152,7 +185,7 @@ export default function CommentaryPlayer({
                       className="speaker-label"
                       style={{ backgroundColor: getSpeakerColor(cap.speaker) }}
                     >
-                      {cap.speaker}
+                      {getDisplayName(cap.speaker)}
                     </span>
                     <p>{cap.original}</p>
                   </div>
@@ -181,7 +214,7 @@ export default function CommentaryPlayer({
                       className="speaker-label"
                       style={{ backgroundColor: getSpeakerColor(cap.speaker) }}
                     >
-                      {cap.speaker}
+                      {getDisplayName(cap.speaker)}
                     </span>
                     <p className="translated-text">{cap.translated}</p>
                   </div>
@@ -198,6 +231,12 @@ export default function CommentaryPlayer({
             </div>
           </div>
         </div>
+      </div>
+
+      <div className="keyboard-hints">
+        <span>Space: play/pause</span>
+        <span>D: download audio</span>
+        <span>S: download SRT</span>
       </div>
     </div>
   );

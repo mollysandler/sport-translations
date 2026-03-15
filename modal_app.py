@@ -11,6 +11,7 @@ app = modal.App("sports-translation-api")
 
 HF_CACHE = modal.Volume.from_name("sports-hf-cache", create_if_missing=True)
 TORCH_CACHE = modal.Volume.from_name("sports-torch-cache", create_if_missing=True)
+FEEDBACK_VOLUME = modal.Volume.from_name("sports-feedback", create_if_missing=True)
 
 image = (
     modal.Image.from_registry(
@@ -43,7 +44,7 @@ secrets = [modal.Secret.from_name("sports-secrets")]
     timeout=60 * 60,
     secrets=secrets,
     max_containers=1,
-    volumes={"/cache/hf": HF_CACHE, "/cache/torch": TORCH_CACHE},
+    volumes={"/cache/hf": HF_CACHE, "/cache/torch": TORCH_CACHE, "/feedback": FEEDBACK_VOLUME},
     enable_memory_snapshot=True
 )
 class TranslatorService:
@@ -145,6 +146,13 @@ class TranslatorService:
             self._sessions[session_id or "default"] = session
         translator = self._get_translator(source_lang, target_lang)
         yield from translator.translate_chunk_stream(wav_bytes, session, overlap_duration_sec=overlap_duration_sec)
+
+    def store_feedback(self, data: dict):
+        import json, datetime
+        data["timestamp"] = datetime.datetime.utcnow().isoformat()
+        with open("/feedback/feedback.jsonl", "a") as f:
+            f.write(json.dumps(data) + "\n")
+        FEEDBACK_VOLUME.commit()
 
     @modal.asgi_app()
     def fastapi_app(self):

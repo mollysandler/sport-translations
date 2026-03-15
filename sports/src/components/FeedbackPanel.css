@@ -114,6 +114,11 @@
   transform: scale(0.98);
 }
 
+.submit-feedback-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .feedback-success {
   display: flex;
   flex-direction: column;

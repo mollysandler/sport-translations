@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { useState, useRef, useCallback } from "react";
 import "./AudioInput.css";
 
 const BASE_URL =
@@ -61,6 +61,50 @@ async function* readSseEvents(response) {
   }
 }
 
+// -- Shared waveform drawing -------------------------------------------------
+
+function drawWaveform(canvas, analyser) {
+  if (!canvas || !analyser) return null;
+
+  const ctx = canvas.getContext("2d");
+  const bufferLength = analyser.frequencyBinCount;
+  const dataArray = new Uint8Array(bufferLength);
+
+  const draw = () => {
+    const frameId = requestAnimationFrame(draw);
+    // Store frameId on the canvas so caller can cancel
+    canvas._animFrameId = frameId;
+    analyser.getByteFrequencyData(dataArray);
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const barWidth = (canvas.width / bufferLength) * 2.5;
+    let x = 0;
+    for (let i = 0; i < bufferLength; i++) {
+      const barHeight = (dataArray[i] / 255) * canvas.height;
+      const gradient = ctx.createLinearGradient(0, canvas.height, 0, canvas.height - barHeight);
+      gradient.addColorStop(0, "#3b82f6");
+      gradient.addColorStop(1, "#1e40af");
+      ctx.fillStyle = gradient;
+      ctx.fillRect(x, canvas.height - barHeight, barWidth - 1, barHeight);
+      x += barWidth;
+      if (x > canvas.width) break;
+    }
+  };
+  draw();
+}
+
+function stopWaveform(canvas, analyser) {
+  if (canvas && canvas._animFrameId) {
+    cancelAnimationFrame(canvas._animFrameId);
+    canvas._animFrameId = null;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+  }
+  if (analyser) {
+    try { analyser.disconnect(); } catch (_) {}
+  }
+}
+
 // -- Component ---------------------------------------------------------------
 
 export default function AudioInput({
@@ -71,6 +115,7 @@ export default function AudioInput({
   onConnectionStatusChange,
   onLanguageDetected,
   audioSegmentsRef,
+  liveAudioControlRef,
   showToast,
 }) {
   const [inputMethod, setInputMethod] = useState("stream");
@@ -94,7 +139,8 @@ export default function AudioInput({
   const firstSegmentReceivedRef = useRef(false);
   const canvasRef = useRef(null);
   const analyserRef = useRef(null);
-  const animFrameRef = useRef(null);
+  const streamCanvasRef = useRef(null);
+  const streamAnalyserRef = useRef(null);
 
   // -- Batch file upload (unchanged) ----------------------------------------
 
@@ -180,8 +226,18 @@ export default function AudioInput({
     }
     sessionIdRef.current = session_id;
 
-    // Playback AudioContext
-    audioCtxRef.current = new AudioContext();
+    // Playback AudioContext + Analyser for stream waveform
+    const ctx = new AudioContext();
+    audioCtxRef.current = ctx;
+    if (liveAudioControlRef) {
+      liveAudioControlRef.current = {
+        pause: () => ctx.suspend(),
+        resume: () => ctx.resume(),
+      };
+    }
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
+    streamAnalyserRef.current = analyser;
     audioQueueRef.current = [];
     isPlayingAudioRef.current = false;
 
@@ -220,6 +276,10 @@ export default function AudioInput({
             firstSegmentReceivedRef.current = true;
             setStreamStatus("streaming");
             if (onConnectionStatusChange) onConnectionStatusChange(false);
+            // Start waveform visualizer for stream
+            if (streamCanvasRef.current && streamAnalyserRef.current) {
+              drawWaveform(streamCanvasRef.current, streamAnalyserRef.current);
+            }
           }
           audioQueueRef.current.push(item.audio_b64);
           if (audioSegmentsRef) audioSegmentsRef.current.push(item.audio_b64);
@@ -238,6 +298,8 @@ export default function AudioInput({
     }
 
     // Stream ended naturally or was stopped
+    stopWaveform(streamCanvasRef.current, streamAnalyserRef.current);
+    streamAnalyserRef.current = null;
     if (onConnectionStatusChange) onConnectionStatusChange(false);
     setStreamStatus("idle");
   };
@@ -245,6 +307,10 @@ export default function AudioInput({
   const handleStopStream = async () => {
     setStreamStatus("stopping");
     if (onConnectionStatusChange) onConnectionStatusChange(false);
+
+    // Stop waveform
+    stopWaveform(streamCanvasRef.current, streamAnalyserRef.current);
+    streamAnalyserRef.current = null;
 
     // Abort session start if still in progress
     if (sessionAbortRef.current) {
@@ -291,7 +357,14 @@ export default function AudioInput({
         await new Promise((resolve) => {
           const src = ctx.createBufferSource();
           src.buffer = audioBuffer;
-          src.connect(ctx.destination);
+          // Route through analyser if available (stream waveform)
+          const analyser = streamAnalyserRef.current;
+          if (analyser) {
+            src.connect(analyser);
+            analyser.connect(ctx.destination);
+          } else {
+            src.connect(ctx.destination);
+          }
           src.onended = resolve;
           src.start();
         });
@@ -366,54 +439,6 @@ export default function AudioInput({
     }
   };
 
-  // -- Waveform visualizer ---------------------------------------------------
-
-  const startVisualizer = () => {
-    const canvas = canvasRef.current;
-    const analyser = analyserRef.current;
-    if (!canvas || !analyser) return;
-
-    const ctx = canvas.getContext("2d");
-    const bufferLength = analyser.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
-
-    const draw = () => {
-      animFrameRef.current = requestAnimationFrame(draw);
-      analyser.getByteFrequencyData(dataArray);
-
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      const barWidth = (canvas.width / bufferLength) * 2.5;
-      let x = 0;
-      for (let i = 0; i < bufferLength; i++) {
-        const barHeight = (dataArray[i] / 255) * canvas.height;
-        const gradient = ctx.createLinearGradient(0, canvas.height, 0, canvas.height - barHeight);
-        gradient.addColorStop(0, "#3b82f6");
-        gradient.addColorStop(1, "#1e40af");
-        ctx.fillStyle = gradient;
-        ctx.fillRect(x, canvas.height - barHeight, barWidth - 1, barHeight);
-        x += barWidth;
-        if (x > canvas.width) break;
-      }
-    };
-    draw();
-  };
-
-  const stopVisualizer = () => {
-    if (animFrameRef.current) {
-      cancelAnimationFrame(animFrameRef.current);
-      animFrameRef.current = null;
-    }
-    if (analyserRef.current) {
-      analyserRef.current.disconnect();
-      analyserRef.current = null;
-    }
-    const canvas = canvasRef.current;
-    if (canvas) {
-      const ctx = canvas.getContext("2d");
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-    }
-  };
-
   // -- Start / stop live ----------------------------------------------------
 
   const handleStartLive = async () => {
@@ -450,7 +475,14 @@ export default function AudioInput({
     sessionIdRef.current = session_id;
 
     // Playback AudioContext
-    audioCtxRef.current = new AudioContext();
+    const playCtx = new AudioContext();
+    audioCtxRef.current = playCtx;
+    if (liveAudioControlRef) {
+      liveAudioControlRef.current = {
+        pause: () => playCtx.suspend(),
+        resume: () => playCtx.resume(),
+      };
+    }
     audioQueueRef.current = [];
     isPlayingAudioRef.current = false;
 
@@ -518,13 +550,14 @@ export default function AudioInput({
     muteGain.connect(captureCtx.destination);
 
     // Start waveform visualizer
-    startVisualizer();
+    drawWaveform(canvasRef.current, analyserRef.current);
   };
 
   const handleStopLive = async () => {
     setLiveStatus("stopping");
     if (onConnectionStatusChange) onConnectionStatusChange(false);
-    stopVisualizer();
+    stopWaveform(canvasRef.current, analyserRef.current);
+    analyserRef.current = null;
 
     // Abort session start if still in progress
     if (sessionAbortRef.current) {
@@ -634,8 +667,9 @@ export default function AudioInput({
                 <div className="recording-active">
                   <div className="recording-indicator">
                     <span className="recording-dot"></span>
-                    Streaming — translating every 8s...
+                    Streaming — translating live...
                   </div>
+                  <canvas ref={streamCanvasRef} className="waveform-canvas" width={300} height={60} />
                   <p className="stream-url-display">{streamUrl}</p>
                   <button onClick={handleStopStream} className="record-button stop">
                     Stop Stream
@@ -660,7 +694,7 @@ export default function AudioInput({
                     </button>
                   </div>
                   <p className="stream-hint">
-                    Paste any direct link to an audio stream. Translates continuously in 8-second chunks.
+                    Paste any direct link to an audio stream. Translates continuously in real time.
                   </p>
                   <div className="sample-links">
                     <span className="sample-label">Try a sample:</span>
@@ -704,7 +738,7 @@ export default function AudioInput({
                 <div className="recording-active">
                   <div className="recording-indicator">
                     <span className="recording-dot"></span>
-                    Live — translating every 8s...
+                    Live — translating continuously...
                   </div>
                   <canvas ref={canvasRef} className="waveform-canvas" width={300} height={60} />
                   <button
@@ -727,7 +761,7 @@ export default function AudioInput({
                 </button>
               )}
               <p className="record-hint">
-                Translates microphone audio in real-time, 8-second chunks
+                Translates microphone audio in real time
               </p>
             </div>
           )}
