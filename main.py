@@ -2459,14 +2459,14 @@ class DynamicSpeakerTranslator:
             return start_sec, end_sec, original_text, translated, mp3_bytes
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_speaker = {}
+            # Submit all, but yield in chronological order (not as_completed)
+            ordered_futures = []
             for (start, end, text), (speaker_id, voice_id) in zip(speech_items, speaker_assignments):
                 fut = executor.submit(_translate_and_tts, start, end, text, voice_id)
-                future_to_speaker[fut] = speaker_id
+                ordered_futures.append((fut, speaker_id))
 
-            for future in as_completed(future_to_speaker):
+            for future, speaker_id in ordered_futures:
                 completed_count += 1
-                speaker_id = future_to_speaker[future]
                 try:
                     start_sec, end_sec, original_text, translated_text, mp3_bytes = future.result()
                 except Exception as e:
