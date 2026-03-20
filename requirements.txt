@@ -20,6 +20,7 @@ torchaudio>=2.2
 
 # --- Utilities ---
 python-dotenv==1.0.1
+yt-dlp>=2025.1.0
 
 # --- Audio / video I/O ---
 pydub==0.25.1

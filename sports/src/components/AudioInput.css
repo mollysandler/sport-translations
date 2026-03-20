@@ -341,3 +341,23 @@
     font-size: 0.9rem;
   }
 }
+
+/* -- YouTube Embed -- */
+
+.yt-embed-section {
+  margin-top: 0.75rem;
+}
+
+.yt-embed {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border: none;
+  border-radius: 8px;
+}
+
+.yt-capture-hint {
+  margin-top: 0.5rem;
+  font-size: 0.78rem;
+  color: #6b7280;
+  line-height: 1.4;
+}

@@ -123,6 +123,7 @@ export default function AudioInput({
   const [isLoading, setIsLoading] = useState(false);
   const [liveStatus, setLiveStatus] = useState("idle"); // idle | connecting | streaming | stopping
   const [streamStatus, setStreamStatus] = useState("idle"); // idle | connecting | streaming | stopping
+  const [ytVideoId, setYtVideoId] = useState(null); // extracted YouTube video ID
 
   const sessionIdRef = useRef(null);
   const micStreamRef = useRef(null);
@@ -141,6 +142,184 @@ export default function AudioInput({
   const analyserRef = useRef(null);
   const streamCanvasRef = useRef(null);
   const streamAnalyserRef = useRef(null);
+
+  // -- YouTube URL detection -------------------------------------------------
+
+  const extractYouTubeId = (url) => {
+    const m = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/);
+    return m ? m[1] : null;
+  };
+
+  const handleStreamUrlChange = (e) => {
+    const val = e.target.value;
+    setStreamUrl(val);
+    setYtVideoId(extractYouTubeId(val));
+  };
+
+  // -- YouTube tab audio capture (uses existing sendPcmChunk pipeline) ------
+
+  const handleStartYouTube = async () => {
+    setStreamStatus("connecting");
+    if (onConnectionStatusChange) onConnectionStatusChange(true);
+    firstSegmentReceivedRef.current = false;
+    if (audioSegmentsRef) audioSegmentsRef.current = [];
+
+    // Create session
+    const sessionAbort = new AbortController();
+    sessionAbortRef.current = sessionAbort;
+    let session_id;
+    try {
+      const res = await fetch(`${BASE_URL}/session/start`, {
+        method: "POST",
+        signal: sessionAbort.signal,
+      });
+      const data = await res.json();
+      session_id = data.session_id;
+    } catch (err) {
+      if (err.name === "AbortError") {
+        setStreamStatus("idle");
+        if (onConnectionStatusChange) onConnectionStatusChange(false);
+        return;
+      }
+      console.error("Session start error:", err);
+      setStreamStatus("idle");
+      if (onConnectionStatusChange) onConnectionStatusChange(false);
+      return;
+    }
+    sessionIdRef.current = session_id;
+
+    // Playback AudioContext for translated audio
+    const playCtx = new AudioContext();
+    audioCtxRef.current = playCtx;
+    if (liveAudioControlRef) {
+      liveAudioControlRef.current = {
+        pause: () => playCtx.suspend(),
+        resume: () => playCtx.resume(),
+      };
+    }
+    audioQueueRef.current = [];
+    isPlayingAudioRef.current = false;
+
+    // Capture tab audio via getDisplayMedia
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,  // required by the API, but we only use audio
+        audio: true,
+        preferCurrentTab: true,
+      });
+      // Stop the video track immediately — we only need audio
+      stream.getVideoTracks().forEach((t) => t.stop());
+      if (stream.getAudioTracks().length === 0) {
+        throw new Error("No audio track — make sure you checked 'Share tab audio' in the dialog");
+      }
+    } catch (err) {
+      console.error("Tab audio capture failed:", err);
+      if (showToast) showToast(
+        err.message.includes("No audio track")
+          ? "No audio captured. Make sure to check 'Share tab audio' in the share dialog."
+          : "Tab audio capture was denied or failed.",
+        "error"
+      );
+      setStreamStatus("idle");
+      if (onConnectionStatusChange) onConnectionStatusChange(false);
+      return;
+    }
+    micStreamRef.current = stream;
+
+    // Signal live mode to parent
+    onAudioSelected({
+      type: "live",
+      source: null,
+      name: "YouTube Translation",
+      timestamp: new Date(),
+      captions: [],
+    });
+
+    setStreamStatus("streaming");
+    if (onConnectionStatusChange) onConnectionStatusChange(false);
+
+    // Audio capture pipeline (same as mic recording)
+    const captureCtx = new AudioContext();
+    captureCtxRef.current = captureCtx;
+    const nativeSR = captureCtx.sampleRate;
+    nativeSRRef.current = nativeSR;
+    const CHUNK_SAMPLES = Math.ceil(CHUNK_SECONDS * nativeSR);
+    pcmBufferRef.current = new Float32Array(0);
+
+    const sourceNode = captureCtx.createMediaStreamSource(stream);
+    sourceNodeRef.current = sourceNode;
+
+    const captureAnalyser = captureCtx.createAnalyser();
+    captureAnalyser.fftSize = 256;
+    // Store in a separate ref slot — streamAnalyserRef is used by drainAudioQueue
+    // for playback routing, so we keep it null to avoid cross-context errors.
+    analyserRef.current = captureAnalyser;
+    sourceNode.connect(captureAnalyser);
+
+    const processor = captureCtx.createScriptProcessor(4096, 1, 1);
+    processorRef.current = processor;
+
+    processor.onaudioprocess = (e) => {
+      const input = e.inputBuffer.getChannelData(0);
+      const prev = pcmBufferRef.current;
+      const next = new Float32Array(prev.length + input.length);
+      next.set(prev);
+      next.set(input, prev.length);
+      pcmBufferRef.current = next;
+
+      if (pcmBufferRef.current.length >= CHUNK_SAMPLES) {
+        const chunk = pcmBufferRef.current.slice(0, CHUNK_SAMPLES);
+        pcmBufferRef.current = pcmBufferRef.current.slice(CHUNK_SAMPLES);
+        sendPcmChunk(chunk);
+      }
+    };
+
+    // Log audio level to help debug capture
+    let ytDbgCount = 0;
+    const origOnaudioprocess = processor.onaudioprocess;
+    processor.onaudioprocess = (e) => {
+      const input = e.inputBuffer.getChannelData(0);
+      if (ytDbgCount++ % 20 === 0) {
+        const rms = Math.sqrt(input.reduce((s, v) => s + v * v, 0) / input.length);
+        console.log(`[YT capture] RMS: ${rms.toFixed(5)} (${rms > 0.001 ? "has audio" : "SILENCE"})`);
+      }
+    };
+    // Re-attach the real handler
+    processor.onaudioprocess = (e) => {
+      const input = e.inputBuffer.getChannelData(0);
+      if (ytDbgCount++ % 20 === 0) {
+        const rms = Math.sqrt(input.reduce((s, v) => s + v * v, 0) / input.length);
+        console.log(`[YT capture] RMS: ${rms.toFixed(5)} (${rms > 0.001 ? "has audio" : "SILENCE"})`);
+      }
+      const prev = pcmBufferRef.current;
+      const next = new Float32Array(prev.length + input.length);
+      next.set(prev);
+      next.set(input, prev.length);
+      pcmBufferRef.current = next;
+      if (pcmBufferRef.current.length >= CHUNK_SAMPLES) {
+        const chunk = pcmBufferRef.current.slice(0, CHUNK_SAMPLES);
+        pcmBufferRef.current = pcmBufferRef.current.slice(CHUNK_SAMPLES);
+        sendPcmChunk(chunk);
+      }
+    };
+
+    captureAnalyser.connect(processor);
+    const muteGain = captureCtx.createGain();
+    muteGain.gain.value = 0;
+    processor.connect(muteGain);
+    muteGain.connect(captureCtx.destination);
+
+    // Start waveform visualizer using the capture analyser
+    if (streamCanvasRef.current) {
+      drawWaveform(streamCanvasRef.current, captureAnalyser);
+    }
+
+    // Auto-stop if the user stops sharing
+    stream.getAudioTracks()[0].onended = () => {
+      handleStopStream();
+    };
+  };
 
   // -- Batch file upload (unchanged) ----------------------------------------
 
@@ -193,6 +372,12 @@ export default function AudioInput({
   const handleStartStream = async (e) => {
     e.preventDefault();
     if (!streamUrl.trim()) return;
+
+    // YouTube URLs → client-side tab audio capture
+    if (ytVideoId) {
+      handleStartYouTube();
+      return;
+    }
 
     setStreamStatus("connecting");
     if (onConnectionStatusChange) onConnectionStatusChange(true);
@@ -308,9 +493,10 @@ export default function AudioInput({
     setStreamStatus("stopping");
     if (onConnectionStatusChange) onConnectionStatusChange(false);
 
-    // Stop waveform
-    stopWaveform(streamCanvasRef.current, streamAnalyserRef.current);
+    // Stop waveform (could be streamAnalyser for direct streams, or analyser for YouTube capture)
+    stopWaveform(streamCanvasRef.current, streamAnalyserRef.current || analyserRef.current);
     streamAnalyserRef.current = null;
+    analyserRef.current = null;
 
     // Abort session start if still in progress
     if (sessionAbortRef.current) {
@@ -318,10 +504,35 @@ export default function AudioInput({
       sessionAbortRef.current = null;
     }
 
-    // Abort the SSE fetch
+    // Abort the SSE fetch (for direct stream URLs)
     if (streamAbortRef.current) {
       streamAbortRef.current.abort();
       streamAbortRef.current = null;
+    }
+
+    // Flush remaining buffered audio (for YouTube tab capture)
+    const remaining = pcmBufferRef.current;
+    if (remaining.length > nativeSRRef.current) {
+      sendPcmChunk(remaining);
+    }
+    pcmBufferRef.current = new Float32Array(0);
+
+    // Clean up audio capture nodes (for YouTube tab capture)
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+    if (sourceNodeRef.current) {
+      sourceNodeRef.current.disconnect();
+      sourceNodeRef.current = null;
+    }
+    if (captureCtxRef.current) {
+      await captureCtxRef.current.close().catch(() => {});
+      captureCtxRef.current = null;
+    }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach((t) => t.stop());
+      micStreamRef.current = null;
     }
 
     // Clean up session
@@ -684,9 +895,9 @@ export default function AudioInput({
                   <div className="stream-input-group">
                     <input
                       type="url"
-                      placeholder="Paste a URL to an audio file or stream"
+                      placeholder="Paste a stream URL or YouTube link"
                       value={streamUrl}
-                      onChange={(e) => setStreamUrl(e.target.value)}
+                      onChange={handleStreamUrlChange}
                       className="stream-input"
                     />
                     <button type="submit" className="submit-button">
@@ -694,7 +905,7 @@ export default function AudioInput({
                     </button>
                   </div>
                   <p className="stream-hint">
-                    Paste any direct link to an audio stream. Translates continuously in real time.
+                    Paste any direct audio stream link or YouTube URL. Translates continuously in real time.
                   </p>
                   <div className="sample-links">
                     <span className="sample-label">Try a sample:</span>
@@ -703,18 +914,33 @@ export default function AudioInput({
                       { label: "France Info (FR)", url: "https://stream.radiofrance.fr/franceinfo/franceinfo_hifi.m3u8" },
                       { label: "Deutsche Welle (DE)", url: "https://rbmn-live.akamaized.net/hls/live/590198/dwstream5/index.m3u8" },
                       { label: "BBC 5 Live Sports (EN)", url: "http://a.files.bbci.co.uk/media/live/manifesto/audio/simulcast/hls/uk/sbr_high/ak/bbc_radio_five_live.m3u8" },
-                      { label: "BBC 5 Sports Extra (EN)", url: "http://a.files.bbci.co.uk/media/live/manifesto/audio/simulcast/hls/uk/sbr_high/ak/bbc_radio_five_live_sports_extra.m3u8" },
+                      { label: "TED Talk (EN/YT)", url: "https://www.youtube.com/watch?v=8jPQjjsBbIc" },
                     ].map((s) => (
                       <button
                         key={s.url}
                         type="button"
                         className="sample-link-button"
-                        onClick={() => setStreamUrl(s.url)}
+                        onClick={() => { setStreamUrl(s.url); setYtVideoId(extractYouTubeId(s.url)); }}
                       >
                         {s.label}
                       </button>
                     ))}
                   </div>
+                  {ytVideoId && (
+                    <div className="yt-embed-section">
+                      <iframe
+                        src={`https://www.youtube-nocookie.com/embed/${ytVideoId}?autoplay=0`}
+                        title="YouTube preview"
+                        className="yt-embed"
+                        allow="autoplay; encrypted-media"
+                        allowFullScreen
+                      />
+                      <p className="yt-capture-hint">
+                        Click Start, then select this tab and check "Share tab audio" in the dialog.
+                        Play the video — audio will be captured and translated live.
+                      </p>
+                    </div>
+                  )}
                 </form>
               )}
             </div>
