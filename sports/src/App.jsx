@@ -54,6 +54,7 @@ function AppInner() {
   const [captions, setCaptions] = useState(() => loadJson(LS_CAPTIONS, []));
   const [isConnecting, setIsConnecting] = useState(false);
   const [livePaused, setLivePaused] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
   const [detectedLanguage, setDetectedLanguage] = useState(
     () => loadJson(LS_DETECTED_LANG, null)
   );
@@ -269,6 +270,9 @@ function AppInner() {
       } else if (e.code === "KeyD" && !e.metaKey && !e.ctrlKey) {
         e.preventDefault();
         downloadAudioRef.current?.();
+      } else if (e.code === "KeyM" && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault();
+        setIsMuted((m) => !m);
       } else if (e.code === "KeyS" && !e.metaKey && !e.ctrlKey) {
         e.preventDefault();
         downloadSrtRef.current?.();
@@ -309,6 +313,7 @@ function AppInner() {
           onLanguageDetected={handleLanguageDetected}
           audioSegmentsRef={audioSegmentsRef}
           liveAudioControlRef={liveAudioControlRef}
+          isMuted={isMuted}
           showToast={showToast}
         />
 
@@ -337,6 +342,8 @@ function AppInner() {
                   speakerNames={speakerNames}
                   livePaused={livePaused}
                   onLivePauseChange={handleLivePauseChange}
+                  isMuted={isMuted}
+                  onMuteToggle={() => setIsMuted((m) => !m)}
                 />
               </div>
 

@@ -198,6 +198,25 @@
   min-width: 50px;
 }
 
+.mute-button {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: transparent;
+  border: 1px solid #d1d5db;
+  font-size: 1.1rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+  flex-shrink: 0;
+}
+
+.mute-button:hover {
+  background: #e5e7eb;
+}
+
 .paused-indicator {
   font-size: 0.8rem;
   color: #d97706;

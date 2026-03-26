@@ -17,6 +17,8 @@ export default function CommentaryPlayer({
   speakerNames,
   livePaused,
   onLivePauseChange,
+  isMuted,
+  onMuteToggle,
 }) {
   const audioRef = useRef(null);
   const scrollRef = useRef(null);
@@ -131,7 +133,7 @@ export default function CommentaryPlayer({
       </div>
 
       {!isScrollable && audioInput.source && (
-        <audio ref={audioRef} src={audioInput.source} />
+        <audio ref={audioRef} src={audioInput.source} muted={isMuted} />
       )}
 
       {/* Play/Pause controls — shown for batch and live, not restored */}
@@ -145,6 +147,10 @@ export default function CommentaryPlayer({
           <span className="play-label">
             {isLive ? livePlayLabel : batchPlayLabel}
           </span>
+
+          <button onClick={onMuteToggle} className="mute-button" title="Keyboard: M">
+            {isMuted ? "\uD83D\uDD07" : "\uD83D\uDD0A"}
+          </button>
 
           {!isLive && (
             <div className="progress-container">
@@ -236,6 +242,7 @@ export default function CommentaryPlayer({
       <div className="keyboard-hints">
         <span>Space: play/pause</span>
         <span>D: download audio</span>
+        <span>M: mute/unmute</span>
         <span>S: download SRT</span>
       </div>
     </div>

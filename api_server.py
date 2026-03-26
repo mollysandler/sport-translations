@@ -1,11 +1,13 @@
 import os, tempfile, traceback, base64, json, subprocess
 import io
 from typing import Any
+import numpy as np
 import torch, torchaudio
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydub import AudioSegment
+from utils import find_silence_split
 
 def wav_bytes_16k_mono(upload: UploadFile) -> bytes:
     data = upload.file.read()
@@ -20,20 +22,29 @@ def wav_bytes_16k_mono(upload: UploadFile) -> bytes:
     return out.getvalue()
 
 
-def stream_chunks_from_url(url: str, chunk_seconds: int = 15, overlap_seconds: float = 3.0):
+def stream_chunks_from_url(
+    url: str,
+    min_chunk_seconds: float = 5.0,
+    max_chunk_seconds: float = 20.0,
+    overlap_seconds: float = 3.0,
+):
     """Yield (WAV bytes, overlap_duration_sec) from a URL using ffmpeg.
 
-    Each chunk is ``chunk_seconds`` long.  The last ``overlap_seconds``
-    of PCM from the previous chunk is prepended to the next one so that
-    Whisper gets full sentence context at chunk boundaries.  The first
-    chunk has ``overlap_duration_sec=0.0``.
+    Reads audio incrementally and splits at silence boundaries between
+    ``min_chunk_seconds`` and ``max_chunk_seconds``.  Falls back to a hard
+    split at ``max_chunk_seconds`` if no silence is found.  The last
+    ``overlap_seconds`` of PCM from the previous chunk is prepended to the
+    next one so that Whisper gets full sentence context at chunk boundaries.
+    The first chunk has ``overlap_duration_sec=0.0``.
     """
     import struct
 
     sample_rate = 16000
-    samples_per_chunk = sample_rate * chunk_seconds
-    bytes_per_chunk = samples_per_chunk * 2  # 16-bit mono
-    overlap_bytes = int(sample_rate * overlap_seconds) * 2
+    read_seconds = 1  # read 1 second at a time
+    read_bytes = sample_rate * 2 * read_seconds
+    min_chunk_samples = int(sample_rate * min_chunk_seconds)
+    max_chunk_samples = int(sample_rate * max_chunk_seconds)
+    overlap_samples = int(sample_rate * overlap_seconds)
 
     cmd = [
         "ffmpeg",
@@ -46,34 +57,65 @@ def stream_chunks_from_url(url: str, chunk_seconds: int = 15, overlap_seconds: f
     ]
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    trailing_buffer = b""
+    pcm_buffer = np.empty(0, dtype=np.int16)
+    trailing_samples = np.empty(0, dtype=np.int16)
+
+    def _pack_wav(int16_data: np.ndarray) -> bytes:
+        raw = int16_data.tobytes()
+        data_len = len(raw)
+        header = struct.pack(
+            "<4sI4s4sIHHIIHH4sI",
+            b"RIFF", 36 + data_len, b"WAVE",
+            b"fmt ", 16, 1, 1,  # PCM, mono
+            sample_rate, sample_rate * 2, 2, 16,
+            b"data", data_len,
+        )
+        return header + raw
+
+    def _emit_chunk(chunk_int16: np.ndarray):
+        """Prepend overlap from previous chunk and return (wav_bytes, overlap_sec)."""
+        nonlocal trailing_samples
+        if trailing_samples.size > 0:
+            combined = np.concatenate([trailing_samples, chunk_int16])
+            overlap_sec = overlap_seconds
+        else:
+            combined = chunk_int16
+            overlap_sec = 0.0
+        # Save trailing portion for next iteration
+        trailing_samples = chunk_int16[-overlap_samples:] if chunk_int16.size >= overlap_samples else chunk_int16.copy()
+        return (_pack_wav(combined), overlap_sec)
+
     try:
         while True:
-            raw = proc.stdout.read(bytes_per_chunk)
-            if not raw or len(raw) < sample_rate * 2:
+            raw = proc.stdout.read(read_bytes)
+            if not raw:
                 break
 
-            # Prepend trailing audio from previous chunk for overlap
-            if trailing_buffer:
-                combined = trailing_buffer + raw
-                overlap_sec = overlap_seconds
-            else:
-                combined = raw
-                overlap_sec = 0.0
+            new_samples = np.frombuffer(raw, dtype=np.int16)
+            pcm_buffer = np.concatenate([pcm_buffer, new_samples])
 
-            # Save trailing portion for next iteration
-            trailing_buffer = raw[-overlap_bytes:] if len(raw) >= overlap_bytes else raw
+            if pcm_buffer.size < min_chunk_samples:
+                continue
 
-            # Wrap combined PCM in a WAV header
-            data_len = len(combined)
-            header = struct.pack(
-                "<4sI4s4sIHHIIHH4sI",
-                b"RIFF", 36 + data_len, b"WAVE",
-                b"fmt ", 16, 1, 1,  # PCM, mono
-                sample_rate, sample_rate * 2, 2, 16,
-                b"data", data_len,
+            # Convert to float32 for silence detection
+            float_buf = pcm_buffer.astype(np.float32) / 32768.0
+            split_idx = find_silence_split(
+                float_buf, sample_rate, min_chunk_samples, max_chunk_samples,
             )
-            yield (header + combined, overlap_sec)
+
+            if split_idx > 0:
+                chunk = pcm_buffer[:split_idx]
+                pcm_buffer = pcm_buffer[split_idx:]
+                yield _emit_chunk(chunk)
+            elif pcm_buffer.size >= max_chunk_samples:
+                # No silence found — hard split at max
+                chunk = pcm_buffer[:max_chunk_samples]
+                pcm_buffer = pcm_buffer[max_chunk_samples:]
+                yield _emit_chunk(chunk)
+
+        # Flush remaining buffer
+        if pcm_buffer.size >= sample_rate:  # at least 1 second
+            yield _emit_chunk(pcm_buffer)
     finally:
         proc.stdout.close()
         proc.terminate()

@@ -1,12 +1,69 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import "./AudioInput.css";
 
 const BASE_URL =
   "https://mollysandler--sports-translation-api-translatorservice-f-6a7378.modal.run";
 
-const CHUNK_SECONDS = 8;
+const MIN_CHUNK_SECONDS = 5;
+const MAX_CHUNK_SECONDS = 16;
+
+/**
+ * Scan backwards from maxSamples toward minSamples looking for consecutive
+ * low-energy windows (~120ms of silence). Two-pass: first strict silence,
+ * then fallback to quietest point (no hard splits).
+ */
+function findSilenceSplit(samples, sr, minSamples, maxSamples) {
+  const windowSamples = Math.floor(sr * 0.03); // 30ms windows
+  const consecutive = 4;
+  const rmsThreshold = 0.02;
+  const end = Math.min(samples.length, maxSamples);
+  const scanStart = minSamples;
+
+  if (end - windowSamples * consecutive < scanStart) return -1;
+
+  // Pre-compute RMS for every window in scan range
+  const firstPos = scanStart;
+  const lastPos = end - windowSamples;
+  const nWindows = Math.floor((lastPos - firstPos) / windowSamples) + 1;
+  if (nWindows <= 0) return -1;
+
+  const rmsValues = new Float32Array(nWindows);
+  for (let i = 0; i < nWindows; i++) {
+    const wStart = firstPos + i * windowSamples;
+    const wEnd = wStart + windowSamples;
+    let sum = 0;
+    for (let k = wStart; k < wEnd; k++) sum += samples[k] * samples[k];
+    rmsValues[i] = Math.sqrt(sum / windowSamples);
+  }
+
+  // Pass 1: scan backwards for `consecutive` windows all below threshold
+  for (let i = nWindows - consecutive; i >= 0; i--) {
+    let allSilent = true;
+    for (let j = 0; j < consecutive; j++) {
+      if (rmsValues[i + j] >= rmsThreshold) { allSilent = false; break; }
+    }
+    if (allSilent) return firstPos + i * windowSamples;
+  }
+
+  // Pass 2: find quietest region (sliding average over `consecutive` windows)
+  let bestAvg = Infinity;
+  let bestI = 0;
+  if (nWindows >= consecutive) {
+    for (let i = 0; i <= nWindows - consecutive; i++) {
+      let sum = 0;
+      for (let j = 0; j < consecutive; j++) sum += rmsValues[i + j];
+      const avg = sum / consecutive;
+      if (avg < bestAvg) { bestAvg = avg; bestI = i; }
+    }
+  } else {
+    for (let i = 0; i < nWindows; i++) {
+      if (rmsValues[i] < bestAvg) { bestAvg = rmsValues[i]; bestI = i; }
+    }
+  }
+  return firstPos + bestI * windowSamples;
+}
 
 // -- WAV encoding helpers ----------------------------------------------------
 
@@ -116,6 +173,7 @@ export default function AudioInput({
   onLanguageDetected,
   audioSegmentsRef,
   liveAudioControlRef,
+  isMuted,
   showToast,
 }) {
   const [inputMethod, setInputMethod] = useState("stream");
@@ -141,6 +199,14 @@ export default function AudioInput({
   const analyserRef = useRef(null);
   const streamCanvasRef = useRef(null);
   const streamAnalyserRef = useRef(null);
+  const playbackGainRef = useRef(null);
+
+  // -- Sync mute state with playback gain node --------------------------------
+  useEffect(() => {
+    if (playbackGainRef.current) {
+      playbackGainRef.current.gain.value = isMuted ? 0 : 1;
+    }
+  }, [isMuted]);
 
   // -- Batch file upload (unchanged) ----------------------------------------
 
@@ -238,6 +304,9 @@ export default function AudioInput({
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 256;
     streamAnalyserRef.current = analyser;
+    const gainNode = ctx.createGain();
+    gainNode.gain.value = isMuted ? 0 : 1;
+    playbackGainRef.current = gainNode;
     audioQueueRef.current = [];
     isPlayingAudioRef.current = false;
 
@@ -357,11 +426,16 @@ export default function AudioInput({
         await new Promise((resolve) => {
           const src = ctx.createBufferSource();
           src.buffer = audioBuffer;
-          // Route through analyser if available (stream waveform)
+          // Route through gain node for mute control
+          const gain = playbackGainRef.current;
           const analyser = streamAnalyserRef.current;
-          if (analyser) {
+          if (analyser && gain) {
             src.connect(analyser);
-            analyser.connect(ctx.destination);
+            analyser.connect(gain);
+            gain.connect(ctx.destination);
+          } else if (gain) {
+            src.connect(gain);
+            gain.connect(ctx.destination);
           } else {
             src.connect(ctx.destination);
           }
@@ -483,6 +557,9 @@ export default function AudioInput({
         resume: () => playCtx.resume(),
       };
     }
+    const gainNode = playCtx.createGain();
+    gainNode.gain.value = isMuted ? 0 : 1;
+    playbackGainRef.current = gainNode;
     audioQueueRef.current = [];
     isPlayingAudioRef.current = false;
 
@@ -512,7 +589,8 @@ export default function AudioInput({
     captureCtxRef.current = captureCtx;
     const nativeSR = captureCtx.sampleRate;
     nativeSRRef.current = nativeSR;
-    const CHUNK_SAMPLES = Math.ceil(CHUNK_SECONDS * nativeSR);
+    const MIN_CHUNK_SAMPLES = Math.ceil(MIN_CHUNK_SECONDS * nativeSR);
+    const MAX_CHUNK_SAMPLES = Math.ceil(MAX_CHUNK_SECONDS * nativeSR);
 
     pcmBufferRef.current = new Float32Array(0);
 
@@ -536,9 +614,20 @@ export default function AudioInput({
       next.set(input, prev.length);
       pcmBufferRef.current = next;
 
-      if (pcmBufferRef.current.length >= CHUNK_SAMPLES) {
-        const chunk = pcmBufferRef.current.slice(0, CHUNK_SAMPLES);
-        pcmBufferRef.current = pcmBufferRef.current.slice(CHUNK_SAMPLES);
+      if (pcmBufferRef.current.length >= MIN_CHUNK_SAMPLES) {
+        const splitIdx = findSilenceSplit(
+          pcmBufferRef.current, nativeSR, MIN_CHUNK_SAMPLES, MAX_CHUNK_SAMPLES
+        );
+        let chunkEnd;
+        if (splitIdx > 0) {
+          chunkEnd = splitIdx;
+        } else if (pcmBufferRef.current.length >= MAX_CHUNK_SAMPLES) {
+          chunkEnd = MAX_CHUNK_SAMPLES;
+        } else {
+          return; // wait for more data or a silence gap
+        }
+        const chunk = pcmBufferRef.current.slice(0, chunkEnd);
+        pcmBufferRef.current = pcmBufferRef.current.slice(chunkEnd);
         sendPcmChunk(chunk);
       }
     };
