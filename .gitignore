@@ -433,3 +433,6 @@ pretrained_models
 
 
 .DS_Store
+
+# Claude Code
+.claude/

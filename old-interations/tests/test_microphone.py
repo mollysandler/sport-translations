@@ -1,6 +1,5 @@
 # test_microphone.py
 import pyaudio
-import time
 
 # Use the same audio configuration as your main app
 RATE = 16000

@@ -1,14 +1,12 @@
 # diarizer.py
-import os
 import torch
 from pyannote.audio import Pipeline
-from typing import List, Dict
+from typing import List
 from dataclasses import dataclass
 import numpy as np
 
 # Fix PyTorch 2.8 - add ALL pyannote safe globals
 import torch.serialization
-from pyannote.audio.core.task import Specifications, Problem, Resolution
 
 from hybrid_config import (
     MIN_SPEAKERS,
@@ -41,7 +39,7 @@ class SpeakerDiarizer:
         print(f"✅ Diarization pipeline loaded on {device}")
     
     def diarize(self, audio_path: str) -> List[SpeakerSegment]:
-        print(f"🎙️ Analyzing speakers in audio...")
+        print("🎙️ Analyzing speakers in audio...")
     
         # Load audio using torchaudio
         import torchaudio

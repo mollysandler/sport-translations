@@ -20,7 +20,6 @@ from typing import Optional, List
 from pydub import AudioSegment
 from pydub.playback import play
 import torchaudio
-import numpy as np
 from dataclasses import dataclass
 from dotenv import load_dotenv  
 load_dotenv()
@@ -114,7 +113,6 @@ class FastStreamingTranslator:
             raise ValueError("ELEVENLABS_API_KEY not found! Please set it.")
         
         from elevenlabs.client import ElevenLabs
-        from elevenlabs import VoiceSettings
         
         self.elevenlabs = ElevenLabs(api_key=api_key)
         print("   ✅ ElevenLabs ready")
@@ -267,7 +265,7 @@ class FastStreamingTranslator:
         for seg in segments:
             speaker_counts[seg.speaker_id] = speaker_counts.get(seg.speaker_id, 0) + 1
         
-        print(f"\n📊 Segment breakdown:")
+        print("\n📊 Segment breakdown:")
         for speaker_id in sorted(speaker_counts.keys()):
             print(f"   {speaker_id}: {speaker_counts[speaker_id]} segments")
         
@@ -275,7 +273,7 @@ class FastStreamingTranslator:
     
     def _assign_voices(self, segments: List[SpeakerSegment]):
         """Assign ElevenLabs voices to speakers"""
-        print(f"\n🎤 Assigning voices...")
+        print("\n🎤 Assigning voices...")
         
         # Pre-made ElevenLabs voices (free tier compatible)
         available_voices = {
@@ -441,7 +439,7 @@ class FastStreamingTranslator:
                 if self.processing_complete.is_set() and self.playback_queue.qsize() > 0:
                     break
             
-            print(f"\n📊 BUFFER READY! Starting playback...\n")
+            print("\n📊 BUFFER READY! Starting playback...\n")
             print("="*70)
             
             segment_count = 0

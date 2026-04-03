@@ -2,10 +2,9 @@
 import os
 import torch
 from pyannote.audio import Pipeline
-from typing import List, Dict, Optional
+from typing import List, Dict
 from dataclasses import dataclass
 import numpy as np
-import librosa
 from huggingface_hub import login
 from collections import defaultdict
 from utils import SpeakerMergeConfig
@@ -16,12 +15,14 @@ MAX_SPEAKERS = 20
 MIN_SEGMENT_DURATION_MS = 300
 SPEAKER_MERGE_GAP_SECONDS = 0.3
 
+
 def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     a = a.astype(np.float32)
     b = b.astype(np.float32)
     na = float(np.linalg.norm(a) + 1e-9)
     nb = float(np.linalg.norm(b) + 1e-9)
     return float(np.dot(a, b) / (na * nb))
+
 
 @dataclass
 class SpeakerSegment:
@@ -30,10 +31,11 @@ class SpeakerSegment:
     end_ms: int
     start_sec: float
     end_sec: float
-    
+
     @property
     def duration_ms(self) -> int:
         return self.end_ms - self.start_ms
+
 
 class SpeakerDiarizer:
     def __init__(self, hf_token: str, merge_config: SpeakerMergeConfig | None = None):
@@ -58,8 +60,10 @@ class SpeakerDiarizer:
 
         # device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
         device = torch.device(
-            "cuda" if torch.cuda.is_available()
-            else "mps" if torch.backends.mps.is_available()
+            "cuda"
+            if torch.cuda.is_available()
+            else "mps"
+            if torch.backends.mps.is_available()
             else "cpu"
         )
         self.pipeline.to(device)
@@ -67,35 +71,36 @@ class SpeakerDiarizer:
         # Optional: speaker embedding model for post-merge consolidation
         self._spkrec = None
         # self._spkrec_device = torch.device("cpu")
-        self._spkrec_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._spkrec_device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
 
         # Speaker merge config (formerly env vars)
         self.merge_config = merge_config or SpeakerMergeConfig()
 
-    def diarize(self, waveform: torch.Tensor, sample_rate: int = 16000) -> List[SpeakerSegment]:
+    def diarize(
+        self, waveform: torch.Tensor, sample_rate: int = 16000
+    ) -> List[SpeakerSegment]:
         """
         FIXED: Now accepts waveform tensor directly from dynamic_voices.py
         This bypasses the 'torchcodec' and 'AudioDecoder' errors.
         """
-        print(f"   🎙️ Analyzing speakers in waveform ({waveform.shape[1]/sample_rate:.1f}s)...")
-    
+        print(
+            f"   🎙️ Analyzing speakers in waveform ({waveform.shape[1] / sample_rate:.1f}s)..."
+        )
+
         # Ensure waveform is mono and correct shape
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
-        
+
         # Pass as dictionary to bypass broken file-loading logic on Mac
-        audio_in_memory = {
-            "waveform": waveform,
-            "sample_rate": sample_rate
-        }
+        audio_in_memory = {"waveform": waveform, "sample_rate": sample_rate}
 
         # Run pipeline
         output = self.pipeline(
-            audio_in_memory,
-            min_speakers=MIN_SPEAKERS,
-            max_speakers=MAX_SPEAKERS
+            audio_in_memory, min_speakers=MIN_SPEAKERS, max_speakers=MAX_SPEAKERS
         )
-                
+
         # --- FIX FOR DIARIZE-OUTPUT WRAPPER ---
         # pyannote 4.x returns DiarizeOutput with .speaker_diarization
         # pyannote 3.x returns Annotation directly (has .itertracks)
@@ -113,23 +118,25 @@ class SpeakerDiarizer:
                 start_ms=int(turn.start * 1000),
                 end_ms=int(turn.end * 1000),
                 start_sec=float(turn.start),
-                end_sec=float(turn.end)
+                end_sec=float(turn.end),
             )
             segments.append(segment)
-        
+
         print(f"   Found {len(segments)} raw segments")
-        
+
         # Process segments (filtering, merging, etc.)
         segments = self._filter_short_segments(segments)
         segments = self._merge_close_segments(segments)
         segments = self._split_long_segments(segments, max_duration_sec=25.0)
         segments = self._consolidate_speakers(waveform, sample_rate, segments)
         segments = self._reattribute_segments(waveform, sample_rate, segments)
-        
+
         unique_speakers = set(seg.speaker_id for seg in segments)
-        print(f"✅ Diarization complete: {len(unique_speakers)} speakers, {len(segments)} segments")
+        print(
+            f"✅ Diarization complete: {len(unique_speakers)} speakers, {len(segments)} segments"
+        )
         return segments
-    
+
     def _reattribute_segments(
         self,
         waveform: torch.Tensor,
@@ -148,10 +155,16 @@ class SpeakerDiarizer:
             return segments
         debug = os.getenv("SPEAKER_REASSIGN_DEBUG", "0") == "1"
         # More conservative gates (defaults are safe for sports)
-        min_ms = int(os.getenv("SPEAKER_REASSIGN_MIN_MS", "900"))          # don’t flip tiny segments
-        top2_margin = float(os.getenv("SPEAKER_REASSIGN_TOP2_MARGIN", "0.03"))  # top1 must beat top2
-        min_best_sim = float(os.getenv("SPEAKER_REASSIGN_MIN_BEST_SIM", "0.55")) # absolute confidence gate
-        boundary_ms = int(os.getenv("SPEAKER_REASSIGN_BOUNDARY_MS", "150"))      # optional boundary skip
+        min_ms = int(os.getenv("SPEAKER_REASSIGN_MIN_MS", "900"))  # noqa: F841 — don’t flip tiny segments
+        top2_margin = float(
+            os.getenv("SPEAKER_REASSIGN_TOP2_MARGIN", "0.03")
+        )  # top1 must beat top2
+        min_best_sim = float(
+            os.getenv("SPEAKER_REASSIGN_MIN_BEST_SIM", "0.55")
+        )  # absolute confidence gate
+        boundary_ms = int(
+            os.getenv("SPEAKER_REASSIGN_BOUNDARY_MS", "150")
+        )  # optional boundary skip
 
         self._load_spkrec()
         if self._spkrec is None:
@@ -171,7 +184,14 @@ class SpeakerDiarizer:
                 continue
             wav = ref.to(self._spkrec_device).float()
             with torch.no_grad():
-                emb = self._spkrec.encode_batch(wav).squeeze(0).squeeze(0).detach().cpu().numpy()
+                emb = (
+                    self._spkrec.encode_batch(wav)
+                    .squeeze(0)
+                    .squeeze(0)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
             centroids[spk] = emb
 
         if len(centroids) <= 1:
@@ -193,11 +213,21 @@ class SpeakerDiarizer:
             # Optional: skip boundary segments (likely turn-taking / overlap edges)
             if boundary_ms > 0:
                 prev_seg = segments_sorted[i - 1] if i > 0 else None
-                next_seg = segments_sorted[i + 1] if i + 1 < len(segments_sorted) else None
-                if prev_seg and prev_seg.speaker_id != seg.speaker_id and abs(seg.start_ms - prev_seg.end_ms) <= boundary_ms:
+                next_seg = (
+                    segments_sorted[i + 1] if i + 1 < len(segments_sorted) else None
+                )
+                if (
+                    prev_seg
+                    and prev_seg.speaker_id != seg.speaker_id
+                    and abs(seg.start_ms - prev_seg.end_ms) <= boundary_ms
+                ):
                     out.append(seg)
                     continue
-                if next_seg and next_seg.speaker_id != seg.speaker_id and abs(next_seg.start_ms - seg.end_ms) <= boundary_ms:
+                if (
+                    next_seg
+                    and next_seg.speaker_id != seg.speaker_id
+                    and abs(next_seg.start_ms - seg.end_ms) <= boundary_ms
+                ):
                     out.append(seg)
                     continue
             if seg.speaker_id not in centroids:
@@ -222,7 +252,14 @@ class SpeakerDiarizer:
 
             wav = chunk.to(self._spkrec_device).float()
             with torch.no_grad():
-                seg_emb = self._spkrec.encode_batch(wav).squeeze(0).squeeze(0).detach().cpu().numpy()
+                seg_emb = (
+                    self._spkrec.encode_batch(wav)
+                    .squeeze(0)
+                    .squeeze(0)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
 
             sims = {spk: _cosine_sim(seg_emb, cemb) for spk, cemb in centroids.items()}
             sims_sorted = sorted(sims.items(), key=lambda kv: kv[1], reverse=True)
@@ -254,102 +291,126 @@ class SpeakerDiarizer:
                         f"Δtop2={delta_top2:.3f} Δcur={delta_cur:.3f}"
                     )
 
-            out.append(SpeakerSegment(
-                speaker_id=new_sid,
-                start_ms=seg.start_ms,
-                end_ms=seg.end_ms,
-                start_sec=seg.start_sec,
-                end_sec=seg.end_sec,
-            ))
+            out.append(
+                SpeakerSegment(
+                    speaker_id=new_sid,
+                    start_ms=seg.start_ms,
+                    end_ms=seg.end_ms,
+                    start_sec=seg.start_sec,
+                    end_sec=seg.end_sec,
+                )
+            )
 
         if changed:
-            print(f"   🔁 Reattributed {changed}/{len(segments)} segments using embeddings (margin={margin})")
+            print(
+                f"   🔁 Reattributed {changed}/{len(segments)} segments using embeddings (margin={margin})"
+            )
 
         # Merge again after relabel
         out = self._merge_close_segments(out)
         return out
 
-    
     def _load_spkrec(self):
-            """
-            Lazy-load SpeechBrain speaker embedding model.
-            """
-            if self._spkrec is not None:
-                return
-            try:
-                from speechbrain.inference.speaker import EncoderClassifier
-            except Exception as e:
-                print("   ⚠️  speechbrain not installed; skip speaker merge embeddings")
-                return
+        """
+        Lazy-load SpeechBrain speaker embedding model.
+        """
+        if self._spkrec is not None:
+            return
+        try:
+            from speechbrain.inference.speaker import EncoderClassifier
+        except Exception:
+            print("   ⚠️  speechbrain not installed; skip speaker merge embeddings")
+            return
 
-            # Keep on CPU to avoid MPS headaches
-            self._spkrec_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self._spkrec = EncoderClassifier.from_hparams(
-                source="speechbrain/spkrec-ecapa-voxceleb",
-                run_opts={"device": str(self._spkrec_device)},
-            )
-            print("   ✅ Speaker embedding model ready")
+        # Keep on CPU to avoid MPS headaches
+        self._spkrec_device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        self._spkrec = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            run_opts={"device": str(self._spkrec_device)},
+        )
+        print("   ✅ Speaker embedding model ready")
 
-    def _filter_short_segments(self, segments: List[SpeakerSegment]) -> List[SpeakerSegment]:
-        filtered = [seg for seg in segments if seg.duration_ms >= MIN_SEGMENT_DURATION_MS]
+    def _filter_short_segments(
+        self, segments: List[SpeakerSegment]
+    ) -> List[SpeakerSegment]:
+        filtered = [
+            seg for seg in segments if seg.duration_ms >= MIN_SEGMENT_DURATION_MS
+        ]
         if len(filtered) < len(segments):
-            print(f"   Filtered out {len(segments)-len(filtered)} short segments")
+            print(f"   Filtered out {len(segments) - len(filtered)} short segments")
         return filtered
-    
-    def _merge_close_segments(self, segments: List[SpeakerSegment]) -> List[SpeakerSegment]:
+
+    def _merge_close_segments(
+        self, segments: List[SpeakerSegment]
+    ) -> List[SpeakerSegment]:
         if not segments:
             return []
-        
+
         segments = sorted(segments, key=lambda x: x.start_ms)
         merged = [segments[0]]
-        
+
         for seg in segments[1:]:
             last = merged[-1]
             gap_sec = (seg.start_ms - last.end_ms) / 1000.0
-            
-            if seg.speaker_id == last.speaker_id and gap_sec <= SPEAKER_MERGE_GAP_SECONDS:
+
+            if (
+                seg.speaker_id == last.speaker_id
+                and gap_sec <= SPEAKER_MERGE_GAP_SECONDS
+            ):
                 # Merge segments
                 merged[-1] = SpeakerSegment(
                     speaker_id=last.speaker_id,
                     start_ms=last.start_ms,
                     end_ms=seg.end_ms,
                     start_sec=last.start_sec,
-                    end_sec=seg.end_sec
+                    end_sec=seg.end_sec,
                 )
             else:
                 merged.append(seg)
-        
+
         if len(merged) < len(segments):
-            print(f"   Merged {len(segments)-len(merged)} close segments")
+            print(f"   Merged {len(segments) - len(merged)} close segments")
         return merged
-    
-    def _split_long_segments(self, segments: List[SpeakerSegment], max_duration_sec: float = 30.0) -> List[SpeakerSegment]:
+
+    def _split_long_segments(
+        self, segments: List[SpeakerSegment], max_duration_sec: float = 30.0
+    ) -> List[SpeakerSegment]:
         result = []
         max_ms = int(max_duration_sec * 1000)
-        
+
         for seg in segments:
             if seg.duration_ms <= max_ms:
                 result.append(seg)
                 continue
-                
+
             # Split long segment
             start = seg.start_ms
             while start < seg.end_ms:
                 end = min(start + max_ms, seg.end_ms)
-                result.append(SpeakerSegment(
-                    speaker_id=seg.speaker_id,
-                    start_ms=start,
-                    end_ms=end,
-                    start_sec=start/1000.0,
-                    end_sec=end/1000.0
-                ))
+                result.append(
+                    SpeakerSegment(
+                        speaker_id=seg.speaker_id,
+                        start_ms=start,
+                        end_ms=end,
+                        start_sec=start / 1000.0,
+                        end_sec=end / 1000.0,
+                    )
+                )
                 start = end
-        
+
         if len(result) > len(segments):
-            print(f"   Split {len(result)-len(segments)} long segments")
+            print(f"   Split {len(result) - len(segments)} long segments")
         return result
 
-    def _collect_ref_audio(self, waveform: torch.Tensor, sr: int, segs: List[SpeakerSegment], target_sec: float = 12.0):
+    def _collect_ref_audio(
+        self,
+        waveform: torch.Tensor,
+        sr: int,
+        segs: List[SpeakerSegment],
+        target_sec: float = 12.0,
+    ):
         """
         Collect up to target_sec of audio for a speaker (for embedding).
         """
@@ -370,7 +431,9 @@ class SpeakerDiarizer:
             return None
         return torch.cat(chunks, dim=1)
 
-    def _consolidate_speakers(self, waveform: torch.Tensor, sr: int, segments: List[SpeakerSegment]) -> List[SpeakerSegment]:
+    def _consolidate_speakers(
+        self, waveform: torch.Tensor, sr: int, segments: List[SpeakerSegment]
+    ) -> List[SpeakerSegment]:
         """
         Post-process pyannote speaker labels:
         - Merge very similar speakers using embeddings
@@ -406,7 +469,14 @@ class SpeakerDiarizer:
             # speechbrain expects batch x time, float
             wav = ref.to(self._spkrec_device).float()
             with torch.no_grad():
-                emb = self._spkrec.encode_batch(wav).squeeze(0).squeeze(0).detach().cpu().numpy()
+                emb = (
+                    self._spkrec.encode_batch(wav)
+                    .squeeze(0)
+                    .squeeze(0)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
             embeds[spk] = emb
 
         if len(embeds) <= 1:
@@ -476,23 +546,23 @@ class SpeakerDiarizer:
             sid = seg.speaker_id
             if sid in rep_for:
                 sid = rep_for[sid]
-            out.append(SpeakerSegment(
-                speaker_id=sid,
-                start_ms=seg.start_ms,
-                end_ms=seg.end_ms,
-                start_sec=seg.start_sec,
-                end_sec=seg.end_sec
-            ))
+            out.append(
+                SpeakerSegment(
+                    speaker_id=sid,
+                    start_ms=seg.start_ms,
+                    end_ms=seg.end_ms,
+                    start_sec=seg.start_sec,
+                    end_sec=seg.end_sec,
+                )
+            )
 
         # Optional: merge close segments again after relabel
         out = self._merge_close_segments(out)
         return out
 
+
 class SportsDiarizer(SpeakerDiarizer):
     def __init__(self, hf_token: str | None = None, merge_config=None):
         if hf_token is None:
-            hf_token = (
-                os.getenv("HUGGING_FACE_TOKEN")
-                or ""
-            )
+            hf_token = os.getenv("HUGGING_FACE_TOKEN") or ""
         super().__init__(hf_token, merge_config=merge_config)

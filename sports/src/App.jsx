@@ -290,8 +290,8 @@ function AppInner() {
     <div className="app-container">
       <header className="app-header">
         <div className="header-content">
-          <h1>Sports Commentary Translator</h1>
-          <p>Translate live sports commentary into your language</p>
+          <h1>Live Audio Translator</h1>
+          <p>Translate live audio into your language</p>
         </div>
       </header>
 

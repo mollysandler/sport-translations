@@ -7,7 +7,6 @@ _wav_bytes_from_audio_np uses scipy (available). _audio_np_from_wav_bytes uses
 torchaudio.load which is stubbed — we monkeypatch it with a scipy-based
 decoder for these tests. _tts_bytes_to_wav uses pydub (available with ffmpeg).
 """
-import io
 import wave
 
 import numpy as np

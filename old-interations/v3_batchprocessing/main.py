@@ -10,7 +10,7 @@ from pydub import AudioSegment
 from pydub.playback import play
 from moviepy.editor import VideoFileClip
 
-from hybrid_config import DEFAULT_SOURCE, DEFAULT_TARGET, SAMPLE_RATE
+from hybrid_config import SAMPLE_RATE
 from v3.translator import AccurateTranslator
 from diarizer import SpeakerDiarizer
 

@@ -3,13 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Sports Translator</title>
+  <title>Live Translator</title>
   <link rel="stylesheet" href="sidepanel.css">
 </head>
 <body>
   <div class="panel">
     <header class="header">
-      <h1>Sports Translator</h1>
+      <h1>Live Translator</h1>
+      <span class="sync-badge hidden" id="syncBadge"></span>
       <span class="status-badge" id="statusBadge">Idle</span>
     </header>
 
@@ -53,13 +54,22 @@
       <button id="startStopBtn" class="btn btn-start">Start Translating</button>
     </div>
 
+    <div class="error-banner hidden" id="errorBanner">
+      <span id="errorMessage"></span>
+      <div class="error-actions">
+        <button id="retryBtn" class="btn-retry">Retry</button>
+        <button id="dismissBtn" class="btn-dismiss">&times;</button>
+      </div>
+    </div>
+
     <div class="warning hidden" id="silenceWarning">
-      ⚠ No audio detected — this site may use DRM protection.
+      No audio detected — this site may use DRM protection.
     </div>
 
     <div class="warming-up hidden" id="warmingUp">
       <div class="spinner"></div>
-      <span>Warming up GPU...</span>
+      <span id="warmingText">Warming up GPU...</span>
+      <span id="elapsedTimer" class="elapsed-timer"></span>
     </div>
 
     <div class="captions" id="captions">

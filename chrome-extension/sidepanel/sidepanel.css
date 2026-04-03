@@ -42,6 +42,30 @@ body {
   font-weight: 500;
 }
 
+.sync-badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 8px;
+  background: #1e293b;
+  color: #64748b;
+  font-weight: 500;
+}
+
+.sync-badge.synced {
+  background: #052e16;
+  color: #4ade80;
+}
+
+.sync-badge.no-video {
+  background: #1e293b;
+  color: #64748b;
+}
+
+.sync-badge.waiting {
+  background: #422006;
+  color: #fbbf24;
+}
+
 .status-badge.connecting {
   background: #422006;
   color: #fbbf24;
@@ -156,6 +180,68 @@ body {
 
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+.error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  background: #7f1d1d;
+  border: 1px solid #dc2626;
+  border-radius: 8px;
+  font-size: 12px;
+  color: #fecaca;
+  animation: fadeIn 0.2s ease-in;
+}
+
+.error-banner #errorMessage {
+  flex: 1;
+  line-height: 1.4;
+}
+
+.error-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.btn-retry {
+  background: #dc2626;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.btn-retry:hover {
+  background: #ef4444;
+}
+
+.btn-dismiss {
+  background: none;
+  border: none;
+  color: #fca5a5;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+
+.btn-dismiss:hover {
+  color: white;
+}
+
+.elapsed-timer {
+  color: #64748b;
+  font-size: 11px;
+  margin-left: auto;
 }
 
 .hidden {

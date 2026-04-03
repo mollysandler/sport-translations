@@ -5,7 +5,6 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from faster_whisper import WhisperModel
 import torch
-import torchaudio
 from TTS.api import TTS  # Coqui TTS - much faster than Bark
 
 class RealtimeTranslator:

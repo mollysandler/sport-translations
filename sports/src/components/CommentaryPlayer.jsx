@@ -202,7 +202,7 @@ export default function CommentaryPlayer({
                     ? "Waiting for server..."
                     : isLive
                       ? "Streaming translation..."
-                      : "Waiting for commentary..."}
+                      : "Waiting for audio..."}
                 </p>
               )}
             </div>

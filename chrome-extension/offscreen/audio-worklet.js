@@ -9,6 +9,17 @@ class ChunkAccumulator extends AudioWorkletProcessor {
     this._silenceRmsSum = 0;
     this._silenceSampleCount = 0;
     this._silenceChecked = false;
+    this._captureActive = true;
+
+    // Listen for capture toggle from offscreen.js
+    this.port.onmessage = (e) => {
+      if (e.data.type === "SET_CAPTURE_ACTIVE") {
+        this._captureActive = e.data.active;
+        // Reset buffer on any toggle to avoid stale/mixed samples
+        this._writeIndex = 0;
+        this._buffer.fill(0);
+      }
+    };
   }
 
   process(inputs) {
@@ -31,6 +42,9 @@ class ChunkAccumulator extends AudioWorkletProcessor {
         }
       }
     }
+
+    // Only accumulate when capture is active
+    if (!this._captureActive) return true;
 
     // Accumulate samples
     for (let i = 0; i < channelData.length; i++) {

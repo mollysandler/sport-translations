@@ -1,8 +1,7 @@
 # diarizer.py
-import os
 import torch
 from pyannote.audio import Pipeline
-from typing import List, Dict
+from typing import List
 from dataclasses import dataclass
 import numpy as np
 
@@ -47,7 +46,7 @@ class SpeakerDiarizer:
         print(f"✅ Diarization pipeline loaded on {device}")
     
     def diarize(self, audio_path: str) -> List[SpeakerSegment]:
-        print(f"🎙️ Analyzing speakers in audio...")
+        print("🎙️ Analyzing speakers in audio...")
     
         # Load audio using torchaudio
         import torchaudio

@@ -195,7 +195,7 @@ def run_stream_test(name: str, url: str):
         else:
             # If first round fails, skip remaining rounds
             if r == 1:
-                print(f"  SKIPPED — stream unreachable")
+                print("  SKIPPED — stream unreachable")
                 return None
 
     if not round_results:
@@ -244,7 +244,7 @@ def main():
     print(f"  Config: min={MIN_CHUNK_SEC}s, max={MAX_CHUNK_SEC}s, sr={SAMPLE_RATE}")
     print(f"  Capture: {CAPTURE_SECONDS}s x {ROUNDS} rounds per stream")
     print(f"  Streams: {len(STREAMS)}")
-    print(f"  Word-split threshold: boundary RMS > 50% of overall RMS")
+    print("  Word-split threshold: boundary RMS > 50% of overall RMS")
 
     summaries = []
     for name, url in STREAMS:

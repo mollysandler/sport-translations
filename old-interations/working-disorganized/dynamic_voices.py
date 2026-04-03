@@ -18,7 +18,7 @@ import tempfile
 from scipy.io.wavfile import write as write_wav
 import torch
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict
 from pydub import AudioSegment
 from pydub.playback import play
 import torchaudio
@@ -230,7 +230,7 @@ class SmartVoiceManager:
         
         # If ALL voices used, allow reuse but prefer unused
         if not gender_matches:
-            print(f"   ⚠️  All voices used, reusing voices")
+            print("   ⚠️  All voices used, reusing voices")
             gender_matches = {
                 vid: props for vid, props in self.available_voices.items()
                 if props["gender"] == gender
@@ -338,7 +338,7 @@ class SmartVoiceManager:
                 )
         
         # Summary
-        print(f"\n📊 Voice Assignment Summary:")
+        print("\n📊 Voice Assignment Summary:")
         for speaker_id, profile in sorted(self.assigned_voices.items()):
             voice_style = self.available_voices[profile.voice_id]['style']
             print(f"   {speaker_id}: {profile.gender} | {profile.avg_pitch:.0f}Hz | {voice_style}")
@@ -1348,7 +1348,7 @@ class DynamicSpeakerTranslator:
                 if self.processing_complete.is_set() and self.playback_queue.qsize() > 0:
                     break
 
-            print(f"\n📊 BUFFER READY! Starting playback...\n")
+            print("\n📊 BUFFER READY! Starting playback...\n")
             print("=" * 70)
 
             count = 0

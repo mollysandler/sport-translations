@@ -148,7 +148,8 @@ class TranslatorService:
         yield from translator.translate_chunk_stream(wav_bytes, session, overlap_duration_sec=overlap_duration_sec)
 
     def store_feedback(self, data: dict):
-        import json, datetime
+        import json
+        import datetime
         data["timestamp"] = datetime.datetime.utcnow().isoformat()
         with open("/feedback/feedback.jsonl", "a") as f:
             f.write(json.dumps(data) + "\n")

@@ -6,7 +6,6 @@ Perfect for live sports where commentators are usually consistent
 
 import asyncio
 import torch
-import numpy as np
 from faster_whisper import WhisperModel
 from TTS.api import TTS
 from speechbrain.inference.speaker import EncoderClassifier

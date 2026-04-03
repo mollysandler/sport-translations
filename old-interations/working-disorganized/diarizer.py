@@ -5,7 +5,6 @@ from pyannote.audio import Pipeline
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 import numpy as np
-import librosa
 from huggingface_hub import login
 from collections import defaultdict
 

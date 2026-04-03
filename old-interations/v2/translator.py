@@ -1,8 +1,6 @@
 # translator.py
 
-import io
 from google.cloud import speech, texttospeech, translate
-from google.api_core.exceptions import GoogleAPICallError
 from hybrid_config import GOOGLE_PROJECT_ID
 
 # --- OPTIMIZATION: Initialize Clients Globally ---

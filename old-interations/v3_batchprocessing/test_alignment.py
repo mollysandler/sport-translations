@@ -18,9 +18,6 @@ def get_speaker_for_segment(whisper_start, whisper_end, diarization_segments):
     
     return best_speaker
 
-from v3.main import get_speaker_for_segment
-from v3.translator import AccurateTranslator
-from diarizer import SpeakerDiarizer
 
 def test():
     # Load previous results (mock or real) to save time, 

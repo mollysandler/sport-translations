@@ -13,7 +13,6 @@ import queue
 import time
 import io
 import torch
-from pathlib import Path
 from typing import Optional, List
 from pydub import AudioSegment
 from pydub.playback import play
@@ -195,7 +194,7 @@ class StreamingTranslatorV2(HybridSportsTranslator):
         for seg in all_segments:
             speaker_counts[seg.speaker_id] = speaker_counts.get(seg.speaker_id, 0) + 1
         
-        print(f"\n📊 Segment breakdown:")
+        print("\n📊 Segment breakdown:")
         for speaker_id in sorted(speaker_counts.keys()):
             count = speaker_counts[speaker_id]
             print(f"   {speaker_id}: {count} segments")
@@ -204,7 +203,7 @@ class StreamingTranslatorV2(HybridSportsTranslator):
     
     def _build_voice_profiles(self, audio: torch.Tensor, segments: List[SpeakerSegment]):
         """Build voice profiles from segments"""
-        print(f"\n🎤 Extracting voice profiles...")
+        print("\n🎤 Extracting voice profiles...")
         
         unique_speakers = set(seg.speaker_id for seg in segments)
         
@@ -385,7 +384,7 @@ class StreamingTranslatorV2(HybridSportsTranslator):
                         print(f"\n📊 Short video: Starting playback with {segments_ready} segments")
                         break
             
-            print(f"\n📊 BUFFER READY! Starting playback...\n")
+            print("\n📊 BUFFER READY! Starting playback...\n")
             print("="*70)
             
             prev_end_ms = 0

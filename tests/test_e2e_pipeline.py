@@ -5,7 +5,6 @@ service chain:  diarizer → whisper → translator → elevenlabs TTS → compo
 
 All heavy deps are stubbed so tests run fast with no real model inference.
 """
-import io
 import types
 
 import numpy as np

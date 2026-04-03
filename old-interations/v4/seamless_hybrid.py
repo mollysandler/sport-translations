@@ -11,13 +11,12 @@ import sys
 import threading
 import queue
 import time
-from pathlib import Path
 from typing import Optional
 from pydub import AudioSegment
 from pydub.playback import play
 import torchaudio
 
-from hybrid_system import HybridSportsTranslator, TranslationSegment
+from hybrid_system import HybridSportsTranslator
 
 
 class StreamingTranslator(HybridSportsTranslator):
@@ -81,7 +80,7 @@ class StreamingTranslator(HybridSportsTranslator):
         print("\n" + "="*70)
         print("🚀 PHASE 2: STREAMING TRANSLATION")
         print("="*70)
-        print(f"⚙️  Starting background processing...")
+        print("⚙️  Starting background processing...")
         print(f"🔊 Will begin playback after {self.buffer_duration_sec}s buffer\n")
         
         # Start processing thread
@@ -218,7 +217,7 @@ class StreamingTranslator(HybridSportsTranslator):
                     print("\n⚠️  Processing finished before buffer filled")
                     break
             
-            print(f"\n🔊 BUFFER READY! Starting playback...\n")
+            print("\n🔊 BUFFER READY! Starting playback...\n")
             print("="*70)
             
             # Start playing

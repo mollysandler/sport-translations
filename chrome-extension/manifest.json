@@ -1,14 +1,15 @@
 {
   "manifest_version": 3,
-  "name": "Live Sports Translator",
+  "name": "Live Translator",
   "version": "1.0.0",
-  "description": "Real-time translation of live sports commentary from any streaming tab",
+  "description": "Real-time translation of audio from any browser tab",
   "permissions": [
     "tabCapture",
     "offscreen",
     "sidePanel",
     "storage",
-    "activeTab"
+    "activeTab",
+    "scripting"
   ],
   "host_permissions": [
     "https://mollysandler--sports-translation-api-translatorservice-f-6a7378.modal.run/*"
@@ -20,7 +21,7 @@
     "default_path": "sidepanel/sidepanel.html"
   },
   "action": {
-    "default_title": "Open Sports Translator",
+    "default_title": "Open Live Translator",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",

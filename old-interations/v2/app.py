@@ -3,7 +3,7 @@ import io
 import tempfile
 import shutil
 import base64 
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pydub import AudioSegment
 from pyannote.audio import Pipeline

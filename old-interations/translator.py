@@ -1,11 +1,8 @@
 import queue
 import threading
 import io
-import os
-import time
 
 import sounddevice as sd
-import numpy as np
 
 from dotenv import load_dotenv
 from pydub import AudioSegment

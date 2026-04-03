@@ -15,11 +15,10 @@ import time
 import io
 import torch
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List
 from pydub import AudioSegment
 from pydub.playback import play
 import torchaudio
-import numpy as np
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
@@ -272,7 +271,7 @@ class OptimizedStreamingTranslator:
         for seg in segments:
             speaker_counts[seg.speaker_id] = speaker_counts.get(seg.speaker_id, 0) + 1
         
-        print(f"\n📊 Segment breakdown:")
+        print("\n📊 Segment breakdown:")
         for speaker_id in sorted(speaker_counts.keys()):
             print(f"   {speaker_id}: {speaker_counts[speaker_id]} segments")
         
@@ -280,7 +279,7 @@ class OptimizedStreamingTranslator:
     
     def _build_voice_profiles(self, audio: torch.Tensor, segments: List[SpeakerSegment]):
         """Build or assign voices"""
-        print(f"\n🎤 Building voice profiles...")
+        print("\n🎤 Building voice profiles...")
         
         unique_speakers = set(seg.speaker_id for seg in segments)
         
@@ -337,7 +336,7 @@ class OptimizedStreamingTranslator:
             
             # Note: This requires Professional/Enterprise plan
             # For now, fall back to pre-made voice
-            print(f"   ⚠️  Voice cloning requires Pro plan, using pre-made voice")
+            print("   ⚠️  Voice cloning requires Pro plan, using pre-made voice")
             os.remove(temp_file)
             
             voices = {
@@ -481,7 +480,7 @@ class OptimizedStreamingTranslator:
                 if self.processing_complete.is_set() and self.playback_queue.qsize() > 0:
                     break
             
-            print(f"\n📊 BUFFER READY! Starting playback...\n")
+            print("\n📊 BUFFER READY! Starting playback...\n")
             print("="*70)
             
             count = 0

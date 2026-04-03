@@ -12,7 +12,7 @@ import torchaudio
 import numpy as np
 import io
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from dataclasses import dataclass
 from pydub import AudioSegment
 from pydub.playback import play
@@ -21,7 +21,7 @@ from TTS.api import TTS
 from scipy.io.wavfile import write as write_wav
 
 # Import your existing diarizer
-from diarizer import SpeakerDiarizer, SpeakerSegment
+from diarizer import SpeakerDiarizer
 
 
 @dataclass
@@ -176,7 +176,7 @@ class HybridSportsTranslator:
             output_path = self._generate_output_path(video_path)
         
         final_audio.export(output_path, format="wav")
-        print(f"\n✅ Translation complete!")
+        print("\n✅ Translation complete!")
         print(f"💾 Saved to: {output_path}")
         
         return output_path
@@ -229,7 +229,7 @@ class HybridSportsTranslator:
         os.remove(temp_analysis_path)
         
         # Extract voice samples for each speaker
-        print(f"\n🎤 Extracting voice profiles...")
+        print("\n🎤 Extracting voice profiles...")
         
         unique_speakers = set(seg.speaker_id for seg in segments)
         
