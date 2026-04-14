@@ -50,8 +50,8 @@
   let extensionPaused = false;
   let userPaused = false;
 
-  const MAX_BUFFER_FRAMES = 150; // hard cap (~5s at 30fps)
-  const CANVAS_SCALE = 720; // capture height (width scales proportionally)
+  const MAX_BUFFER_FRAMES = 300; // hard cap (~10s at 30fps — must accommodate full pipeline delay)
+  const CANVAS_SCALE = 480; // capture height (lower = less memory, 300 frames at 480p ≈ 500MB)
 
   // Canvas pool: reuse capture canvases instead of creating/GC-ing 30/sec
   let canvasPool = [];
@@ -109,12 +109,10 @@
   // -------------------------------------------------------------------------
 
   function detectDRM() {
-    // Always use seekback mode. Canvas overlay rendering is unreliable —
-    // Chrome's GPU-accelerated video decode does not properly expose frame
-    // data to off-DOM canvas drawImage calls, causing the display canvas to
-    // be permanently transparent on YouTube and other sites.
-    // Seekback mode keeps the real video element visible at all times.
-    return true;
+    if (!video) return true;
+    if (!video.requestVideoFrameCallback) return true;
+    if (video.mediaKeys) return true;
+    return false;
   }
 
   // -------------------------------------------------------------------------
@@ -132,21 +130,34 @@
     // Create canvas, sized to match video display area
     canvasEl = document.createElement("canvas");
     canvasEl.id = "__live-translator-canvas";
-    canvasEl.style.cssText = `
-      position: absolute;
-      top: 0; left: 0; width: 100%; height: 100%;
-      z-index: 999998;
-      pointer-events: none;
-    `;
     canvasCtx = canvasEl.getContext("2d");
 
     if (getComputedStyle(parent).position === "static") {
       parent.style.position = "relative";
     }
-    parent.appendChild(canvasEl);
 
-    // Size canvas drawing buffer
-    resizeCanvas();
+    // Size canvas drawing buffer AND CSS display to match the video's layout.
+    // CRITICAL: Do NOT use CSS `width: 100%; height: 100%` — on YouTube,
+    // the parent's content box can differ from the video's display area,
+    // causing the drawing buffer and CSS size to mismatch. This makes
+    // drawn content appear at wrong positions or be invisible.
+    const videoRect = video.getBoundingClientRect();
+    const parentRect = parent.getBoundingClientRect();
+    const cssW = Math.round(videoRect.width);
+    const cssH = Math.round(videoRect.height);
+    canvasEl.width = cssW;
+    canvasEl.height = cssH;
+    canvasEl.style.cssText = `
+      position: absolute;
+      top: ${Math.round(videoRect.top - parentRect.top)}px;
+      left: ${Math.round(videoRect.left - parentRect.left)}px;
+      width: ${cssW}px;
+      height: ${cssH}px;
+      z-index: 999998;
+      pointer-events: none;
+    `;
+
+    parent.appendChild(canvasEl);
     resizeObs = new ResizeObserver(resizeCanvas);
     resizeObs.observe(video);
     document.addEventListener("fullscreenchange", resizeCanvas);
@@ -162,14 +173,6 @@
       (document.head || document.documentElement).appendChild(hideStyleEl);
     }
 
-    console.log(
-      "[content] Canvas mode started.",
-      "Canvas:", canvasEl.width, "x", canvasEl.height,
-      "Video:", video.videoWidth, "x", video.videoHeight,
-      "Parent:", parent.tagName, parent.className,
-      "Ctx:", !!canvasCtx
-    );
-
     // Compute frame delay from target latency
     updateDelayFrames();
 
@@ -180,17 +183,22 @@
 
   function resizeCanvas() {
     if (!canvasEl || !video) return;
-    const rect = video.getBoundingClientRect();
-    const w = Math.round(Math.min(rect.width, 1920));
-    const h = Math.round(Math.min(rect.height, 1080));
-    // Skip if dimensions are zero (player transitioning) or unchanged.
-    // CRITICAL: setting canvasEl.width or .height — even to the same value —
-    // clears the entire drawing buffer to transparent. YouTube's ResizeObserver
-    // fires frequently, so without this guard the canvas is permanently blank.
+    const videoRect = video.getBoundingClientRect();
+    const w = Math.round(Math.min(videoRect.width, 1920));
+    const h = Math.round(Math.min(videoRect.height, 1080));
     if (w === 0 || h === 0) return;
     if (canvasEl.width === w && canvasEl.height === h) return;
     canvasEl.width = w;
     canvasEl.height = h;
+    // Also update CSS dimensions to match (keeps drawing buffer and display in sync)
+    canvasEl.style.width = w + "px";
+    canvasEl.style.height = h + "px";
+    const parent = canvasEl.parentElement;
+    if (parent) {
+      const parentRect = parent.getBoundingClientRect();
+      canvasEl.style.top = Math.round(videoRect.top - parentRect.top) + "px";
+      canvasEl.style.left = Math.round(videoRect.left - parentRect.left) + "px";
+    }
   }
 
   function updateDelayFrames() {
@@ -540,12 +548,16 @@
 
       case "PLAYBACK_STARTED":
         // Audio playback has begun — start drawing delayed frames.
-        // The frame buffer accumulated during the buffer phase IS the delay
-        // mechanism. Do NOT trim it — the delay keeps canvas behind live video
-        // by the pipeline latency, matching where the audio is.
+        // The full buffer IS the delay — the oldest frame corresponds to the
+        // video that was playing when capture started, which is when the first
+        // audio was captured and sent to the backend for translation.
         if (syncMode === "canvas") {
           drawingActive = true;
-          console.log(`[content] Canvas drawing activated, buffer: ${frameBuffer.length} frames`);
+          console.log(
+            `[content] Canvas drawing activated.`,
+            `Buffer: ${frameBuffer.length} frames`,
+            `(~${(frameBuffer.length / 30).toFixed(1)}s delay)`
+          );
         }
         sendResponse({ ok: true });
         break;

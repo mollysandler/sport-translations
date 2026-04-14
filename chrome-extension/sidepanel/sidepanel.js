@@ -195,16 +195,21 @@ function addCaption(caption) {
   // Uses substring matching to catch segments where the backend splits the
   // same speech differently on re-capture at the overlap boundary.
   const newText = (caption.translated || caption.text || "").trim();
+  const newWords = newText.toLowerCase().replace(/[^\w\s]/g, "").split(/\s+/);
   const recent = captions.slice(-10);
   if (newText && recent.some(c => {
     const oldText = (c.translated || c.text || "").trim();
     if (!oldText) return false;
     // Exact match
     if (oldText === newText) return true;
-    // New is a substring of a recent caption (partial re-segment)
-    if (oldText.includes(newText)) return true;
-    // Recent caption is a substring of new (new is a longer re-segment)
-    if (newText.includes(oldText) && oldText.length > 20) return true;
+    // Substring match
+    if (oldText.includes(newText) || (newText.includes(oldText) && oldText.length > 20)) return true;
+    // Word overlap: if 60%+ of words in the new caption appear in a recent one, it's a duplicate
+    if (newWords.length >= 4) {
+      const oldWords = new Set(oldText.toLowerCase().replace(/[^\w\s]/g, "").split(/\s+/));
+      const overlap = newWords.filter(w => oldWords.has(w)).length;
+      if (overlap / newWords.length >= 0.6) return true;
+    }
     return false;
   })) {
     return;

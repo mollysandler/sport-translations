@@ -456,11 +456,11 @@ describe("Netflix seekback mode — content script", () => {
       expect(env.video.playbackRate).toBe(0.95);
     });
 
-    test("rate adjustment always applies (always seekback mode)", () => {
+    test("rate adjustment ignored in canvas mode (not seekback)", () => {
       const env = loadContentScript({ drm: false, videoOpts: { mediaKeys: null } });
       env.sendMsg({ type: "START_SYNC" });
-      env.sendMsg({ type: "VIDEO_ADJUST_RATE", rate: 0.95 });
-      expect(env.video.playbackRate).toBe(0.95);
+      env.sendMsg({ type: "VIDEO_ADJUST_RATE", rate: 0.5 });
+      expect(env.video.playbackRate).toBe(1.0);
     });
   });
 

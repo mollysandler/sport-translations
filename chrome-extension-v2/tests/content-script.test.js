@@ -237,12 +237,10 @@ describe("DRM detection", () => {
     expect(resp).toHaveBeenCalledWith(expect.objectContaining({ mode: "seekback" }));
   });
 
-  test("normal video (RVFC + no mediaKeys) → seekback mode (canvas disabled)", () => {
-    // Canvas mode is disabled because Chrome's GPU-accelerated video decode
-    // does not reliably expose frame data to off-DOM canvas drawImage calls.
+  test("normal video (RVFC + no mediaKeys) → canvas mode", () => {
     const env = loadContentScript();
     const resp = env.sendMsg({ type: "START_SYNC" });
-    expect(resp).toHaveBeenCalledWith(expect.objectContaining({ ok: true, mode: "seekback" }));
+    expect(resp).toHaveBeenCalledWith(expect.objectContaining({ ok: true, mode: "canvas" }));
   });
 
   test("no video → reports ok: false", () => {
@@ -253,32 +251,42 @@ describe("DRM detection", () => {
 });
 
 // ===================================================================
-// Canvas mode (disabled — always uses seekback instead)
-// Canvas overlay rendering is unreliable on YouTube/Chrome due to
-// GPU-accelerated video decode not exposing frame data to off-DOM
-// canvas drawImage calls. All sites use seekback mode.
+// Canvas mode
 // ===================================================================
 
-describe("sync mode selection", () => {
-  test("always selects seekback mode regardless of video capabilities", () => {
-    const env = loadContentScript();
-    const resp = env.sendMsg({ type: "START_SYNC" });
-    expect(resp).toHaveBeenCalledWith(
-      expect.objectContaining({ ok: true, mode: "seekback" })
-    );
-  });
-
-  test("no canvas element created", () => {
+describe("canvas mode", () => {
+  test("canvas element created on START_SYNC", () => {
     const env = loadContentScript();
     env.sendMsg({ type: "START_SYNC" });
     const canvases = env.createdElements.filter((e) => e.tag === "canvas");
-    expect(canvases.length).toBe(0);
+    expect(canvases.length).toBeGreaterThanOrEqual(1);
   });
 
-  test("video NOT hidden (stays visible)", () => {
+  test("video hidden via CSS class", () => {
     const env = loadContentScript();
     env.sendMsg({ type: "START_SYNC" });
-    expect(env.video.style.opacity).not.toBe("0");
+    expect(env.video.classList.contains("__lt-hidden")).toBe(true);
+  });
+
+  test("SYNC_MODE message sent with 'canvas'", () => {
+    const env = loadContentScript();
+    env.sendMsg({ type: "START_SYNC" });
+    expect(env.sentMessages()).toContainEqual(
+      expect.objectContaining({ type: "SYNC_MODE", mode: "canvas" })
+    );
+  });
+
+  test("requestVideoFrameCallback called to start frame capture", () => {
+    const env = loadContentScript();
+    env.sendMsg({ type: "START_SYNC" });
+    expect(env.video.requestVideoFrameCallback).toHaveBeenCalled();
+  });
+
+  test("cleanup restores video visibility", () => {
+    const env = loadContentScript();
+    env.sendMsg({ type: "START_SYNC" });
+    expect(env.video.classList.contains("__lt-hidden")).toBe(true);
+    env.sendMsg({ type: "VIDEO_CLEANUP" });
     expect(env.video.classList.contains("__lt-hidden")).toBe(false);
   });
 });
@@ -329,11 +337,11 @@ describe("seekback mode", () => {
     expect(env.video.playbackRate).toBe(0.95);
   });
 
-  test("VIDEO_ADJUST_RATE applies in seekback mode (always active)", () => {
-    const env = loadContentScript();
+  test("VIDEO_ADJUST_RATE ignored in canvas mode", () => {
+    const env = loadContentScript(); // no DRM → canvas mode
     env.sendMsg({ type: "START_SYNC" });
-    env.sendMsg({ type: "VIDEO_ADJUST_RATE", rate: 0.95 });
-    expect(env.video.playbackRate).toBe(0.95);
+    env.sendMsg({ type: "VIDEO_ADJUST_RATE", rate: 0.5 });
+    expect(env.video.playbackRate).toBe(1.0); // unchanged
   });
 });
 

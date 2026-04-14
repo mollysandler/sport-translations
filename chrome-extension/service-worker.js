@@ -14,6 +14,8 @@ let replayZoneEnd = 0;            // video position where replay zone ends
 let captureResumed = false;       // true after RESUME_CAPTURE — only then adapt rate
 const RATE_ADJUST_COOLDOWN_MS = 2000;
 let lastRateAdjustAt = 0;
+let lastSeekTarget = 0;           // video position after last seek (for drift estimation)
+let lastSeekWallTime = 0;         // wall clock when seek was issued
 
 // AbortController for cancelling an in-progress start
 let startAbortController = null;
@@ -75,7 +77,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // Offscreen reports buffer health — adjust video rate adaptively
   if (message.type === "BUFFER_STATUS") {
-    handleBufferStatus(message.bufferAheadMs);
+    handleBufferStatus(message);
   }
 
   // Messages from offscreen that need to reach the side panel
@@ -104,6 +106,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
+function estimateVideoPosition() {
+  if (lastSeekWallTime === 0) return null;
+  return lastSeekTarget + (Date.now() - lastSeekWallTime) / 1000 * currentVideoRate;
+}
+
 // -- Phase 2: Transition to playback ------------------------------------------
 
 function handleTransitionToPlayback(msg) {
@@ -131,6 +138,10 @@ function handleTransitionToPlayback(msg) {
           type: "VIDEO_ADJUST_RATE",
           rate: currentVideoRate,
         }).catch(() => {});
+
+        // Store seek params for video position estimation
+        lastSeekTarget = seekTarget;
+        lastSeekWallTime = Date.now();
 
         // Replay zone ends at seekTarget + totalAudioSentSec
         replayZoneEnd = seekTarget + totalAudioSentSec;
@@ -162,9 +173,12 @@ function startReplayZonePoll() {
         if (pos >= replayZoneEnd - 3) {
           console.log(`[sw] Replay zone ended at video pos ${pos.toFixed(1)}s (target: ${replayZoneEnd.toFixed(1)}s)`);
           stopReplayZonePoll();
-          captureResumed = true;
-          // Tell offscreen to resume capturing
-          chrome.runtime.sendMessage({ type: "RESUME_CAPTURE" }).catch(() => {});
+          if (!captureResumed) {
+            captureResumed = true;
+            chrome.runtime.sendMessage({ type: "RESUME_CAPTURE" }).catch(() => {});
+          }
+          // Tell offscreen the zone is over — safe to send all new chunks
+          chrome.runtime.sendMessage({ type: "ZONE_ENDED" }).catch(() => {});
         }
       })
       .catch(() => {});
@@ -180,27 +194,61 @@ function stopReplayZonePoll() {
 
 // -- Phase 3: Adaptive video rate based on buffer health ----------------------
 
-function handleBufferStatus(bufferAheadMs) {
+function handleBufferStatus({ bufferAheadMs, totalAudioContentSec }) {
   if (!videoFound || !captureTabId) return;
 
   const bufferSec = bufferAheadMs / 1000;
   const now = Date.now();
+
+  // If still in replay zone and buffer is getting low, resume capture early
+  // so the held chunk can be sent while there's still buffer to cover the
+  // backend processing time (~1-3s).
+  if (!captureResumed && bufferSec < 5) {
+    console.log(`[sw] Buffer low (${bufferSec.toFixed(1)}s) during replay — sending held chunk early`);
+    captureResumed = true;
+    chrome.runtime.sendMessage({ type: "RESUME_CAPTURE" }).catch(() => {});
+  }
 
   // Adaptive rate: only after capture has resumed (not during replay zone,
   // where the buffer is finite and would drain if we speed up).
   if (captureResumed && now - lastRateAdjustAt >= RATE_ADJUST_COOLDOWN_MS) {
     let newRate = currentVideoRate;
 
-    if (bufferSec > 8) {
-      newRate = Math.min(currentVideoRate + 0.10, 1.0);   // buffer very healthy → speed up fast
-    } else if (bufferSec > 6) {
-      newRate = Math.min(currentVideoRate + 0.05, 1.0);   // buffer healthy → speed up
-    } else if (bufferSec < 2) {
-      newRate = Math.max(currentVideoRate - 0.05, 0.5);   // buffer low → slow down
+    // Content alignment signal: detect drift between audio content position
+    // and video position in either direction, and slow video to converge.
+    if (typeof totalAudioContentSec === "number") {
+      const estimatedVideoPos = estimateVideoPosition();
+      if (estimatedVideoPos !== null) {
+        const contentDriftSec = totalAudioContentSec - estimatedVideoPos;
+        if (contentDriftSec > 3) {
+          // Audio ahead of video — slow video so video catches up
+          const reduction = Math.min((contentDriftSec - 3) * 0.02 + 0.05, 0.25);
+          newRate = Math.max(currentVideoRate - reduction, 0.5);
+        } else if (contentDriftSec < -3) {
+          // Video ahead of audio — slow video so audio catches up
+          const reduction = Math.min((Math.abs(contentDriftSec) - 3) * 0.02 + 0.05, 0.25);
+          newRate = Math.max(currentVideoRate - reduction, 0.5);
+        }
+      }
     }
-    // buffer 2-6s → hold rate
+
+    // Buffer health signal: only if content drift didn't already adjust rate
+    if (newRate === currentVideoRate) {
+      if (bufferSec > 8) {
+        newRate = Math.min(currentVideoRate + 0.10, 1.0);
+      } else if (bufferSec > 6) {
+        newRate = Math.min(currentVideoRate + 0.05, 1.0);
+      } else if (bufferSec < 2) {
+        newRate = Math.max(currentVideoRate - 0.05, 0.5);
+      }
+    }
 
     if (newRate !== currentVideoRate) {
+      // Snapshot video position estimate before rate change for accuracy
+      if (lastSeekWallTime > 0) {
+        lastSeekTarget = estimateVideoPosition();
+        lastSeekWallTime = Date.now();
+      }
       console.log(`[sw] Buffer ${bufferSec.toFixed(1)}s → rate ${currentVideoRate.toFixed(2)} → ${newRate.toFixed(2)}`);
       currentVideoRate = newRate;
       lastRateAdjustAt = now;
@@ -242,6 +290,8 @@ async function handleStartCapture({ sourceLang, targetLang }) {
   currentVideoRate = 1.0;
   lastRateAdjustAt = 0;
   captureResumed = false;
+  lastSeekTarget = 0;
+  lastSeekWallTime = 0;
   stopReplayZonePoll();
 
   // Inject content script early (before backend call which may cold-start)

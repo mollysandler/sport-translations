@@ -188,6 +188,7 @@ function createMockVideo(opts = {}) {
     appendChild: jest.fn(),
     removeChild: jest.fn(),
     children: [],
+    getBoundingClientRect: jest.fn(() => ({ width: opts.displayWidth || 960, height: opts.displayHeight || 540, top: 0, left: 0 })),
   };
 
   return video;

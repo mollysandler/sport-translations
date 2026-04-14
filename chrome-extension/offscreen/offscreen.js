@@ -28,7 +28,11 @@ let captionQueue = [];                // captions held during buffering, release
 let segmentCount = 0;                 // total segments scheduled
 let bufferFallbackTimer = null;       // fallback to start playing with partial buffer
 let totalAudioSentSec = 0;           // cumulative seconds of audio sent to backend
-const TARGET_BUFFER_SEC = 16;         // buffer enough audio to survive the replay→capture transition gap
+const TARGET_BUFFER_SEC = 24;         // buffer enough audio to survive the replay→capture transition gap
+let holdChunks = false;               // true during replay zone — hold chunks instead of sending
+let heldChunk = null;                 // most recent held chunk (sent when replay zone ends)
+let scheduledAudioDuration = 0;       // cumulative actual audio duration scheduled for playback
+let replayContentBoundary = 0;        // content position (sec) already translated; segments before this are replayed duplicates
 
 // Single reusable context for decoding audio during the buffering phase.
 let decodeCtx = null;
@@ -86,12 +90,20 @@ async function* readSseEvents(response) {
 
 // -- Resample to 16kHz and send chunk -----------------------------------------
 
-async function sendPcmChunk(samples, nativeSR) {
+async function sendPcmChunk(samples, nativeSR, bypassHold = false) {
   if (!sessionId || samples.length < 100 || globalAbort.signal.aborted) return;
 
   chunkCount++;
   const chunkNum = chunkCount;
   console.log(`[offscreen] Sending chunk #${chunkNum}, ${samples.length} samples at ${nativeSR}Hz`);
+
+  // During replay zone: hold chunks instead of sending (they'd produce duplicates).
+  // Keep only the latest — when replay ends, it's sent immediately.
+  if (holdChunks && !bypassHold) {
+    console.log(`[offscreen] Holding chunk #${chunkNum} (replay zone)`);
+    heldChunk = { samples: samples.slice(), nativeSR };
+    return;
+  }
 
   // First chunk: transition to buffering state
   if (!captureStartedAt) {
@@ -217,8 +229,8 @@ async function sendPcmChunk(samples, nativeSR) {
             latencyMs: initialLatencyMs,
           }).catch(() => {});
         }
-        // Pre-decode immediately on arrival
-        decodeAndQueue(item.audio_b64);
+        // Pre-decode immediately on arrival, with source timing for pacing
+        decodeAndQueue(item.audio_b64, item.caption?.startTime, item.caption?.endTime);
         // Hold captions during buffering, send immediately when playing
         if (playbackState === "playing") {
           chrome.runtime.sendMessage({
@@ -256,7 +268,13 @@ function getDecodeContext() {
   return decodeCtx;
 }
 
-function decodeAndQueue(b64) {
+function decodeAndQueue(b64, sourceStart, sourceEnd) {
+  // Filter out segments for already-translated content (replay zone duplicates).
+  if (replayContentBoundary > 0 && sourceStart != null && sourceStart < replayContentBoundary) {
+    console.log(`[offscreen] Skipping replayed segment (start=${sourceStart.toFixed(1)}s < boundary=${replayContentBoundary.toFixed(1)}s)`);
+    return;
+  }
+
   const raw = atob(b64);
   const bytes = new Uint8Array(raw.length);
   for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
@@ -264,7 +282,7 @@ function decodeAndQueue(b64) {
   const ctx = getDecodeContext();
 
   ctx.decodeAudioData(bytes.buffer.slice(0)).then((audioBuffer) => {
-    decodedQueue.push(audioBuffer);
+    decodedQueue.push({ audioBuffer, sourceStart, sourceEnd });
     bufferedDuration += audioBuffer.duration;
 
     if (playbackState === "buffering") {
@@ -283,22 +301,18 @@ function decodeAndQueue(b64) {
 function startPlayback() {
   console.log(`[offscreen] Starting playback with ${bufferedDuration.toFixed(1)}s buffered`);
   playbackState = "playing";
+  replayContentBoundary = totalAudioSentSec;
   if (bufferFallbackTimer) { clearTimeout(bufferFallbackTimer); bufferFallbackTimer = null; }
 
-  // Mute the worklet — stop capturing during the replay zone.
-  // This cleanly avoids re-capture instead of the fragile skip-counting approach.
-  if (workletNode) {
-    workletNode.port.postMessage({ type: "SET_CAPTURE_ACTIVE", active: false });
-  }
+  // Hold chunks during replay zone — worklet keeps capturing but chunks
+  // are held (not sent to backend) to avoid duplicates. When the replay
+  // zone ends, the held chunk is sent immediately, saving 8s of accumulation.
+  holdChunks = true;
+  heldChunk = null;
 
-  // Measure throughput from first segment received (backend warm), not from
-  // captureStartedAt (which includes chunk accumulation time and first-chunk
-  // Whisper warmup, making the rate pessimistically slow).
-  const measureFrom = firstSegmentReceivedAt || captureStartedAt;
-  const elapsedSec = (Date.now() - measureFrom) / 1000;
-  const measuredRate = elapsedSec > 0 ? Math.min(bufferedDuration / elapsedSec, 1.0) : 0.75;
-  const safeRate = Math.max(measuredRate * 0.9, 0.5); // small safety margin, floor at 0.5
-  console.log(`[offscreen] Measured throughput: ${measuredRate.toFixed(2)}, safe rate: ${safeRate.toFixed(2)}`);
+  // Start at 1.0x — the buffer gives us a cushion, and the adaptive rate
+  // in the service worker will slow the video only if the buffer actually drains.
+  const safeRate = 1.0;
 
   // Close the temporary decode context — playbackCtx takes over decoding
   if (decodeCtx) { decodeCtx.close().catch(() => {}); decodeCtx = null; }
@@ -339,10 +353,14 @@ function scheduleBuffers() {
   if (playbackCtx.state === "suspended") playbackCtx.resume();
 
   while (decodedQueue.length > 0) {
-    const audioBuffer = decodedQueue.shift();
+    const item = decodedQueue.shift();
+    const audioBuffer = item.audioBuffer || item; // support both formats
+    const sourceDuration =
+      (item.sourceEnd != null && item.sourceStart != null)
+        ? item.sourceEnd - item.sourceStart
+        : null;
 
-    // Queue underrun recovery: if nextPlayTime has fallen behind the current
-    // AudioContext time (backend was slow, queue ran dry), jump forward to now
+    // Queue underrun recovery
     if (nextPlayTime < playbackCtx.currentTime) {
       console.log(
         `[offscreen] Queue underrun: nextPlayTime=${nextPlayTime.toFixed(3)}, ` +
@@ -355,7 +373,17 @@ function scheduleBuffers() {
     source.buffer = audioBuffer;
     source.connect(playbackCtx.destination);
     source.start(nextPlayTime);
-    nextPlayTime += audioBuffer.duration;
+
+    // Use the longer of TTS duration and source slot duration.
+    // If TTS is shorter → natural pause fills the gap (matches source rhythm).
+    // If TTS is longer → slight overflow (acceptable drift).
+    // If no source timing → gapless (backward compat).
+    const slotDuration =
+      (sourceDuration != null && sourceDuration > audioBuffer.duration)
+        ? sourceDuration
+        : audioBuffer.duration;
+    nextPlayTime += slotDuration;
+    scheduledAudioDuration += audioBuffer.duration;
 
     segmentCount++;
     source.onended = () => { checkBuffer(); };
@@ -375,6 +403,8 @@ function checkBuffer() {
   chrome.runtime.sendMessage({
     type: "BUFFER_STATUS",
     bufferAheadMs,
+    totalAudioContentSec: totalAudioSentSec,
+    scheduledAudioDuration,
   }).catch(() => {});
 }
 
@@ -480,6 +510,10 @@ async function stopCapture() {
   captionQueue = [];
   segmentCount = 0;
   totalAudioSentSec = 0;
+  holdChunks = false;
+  heldChunk = null;
+  scheduledAudioDuration = 0;
+  replayContentBoundary = 0;
   if (bufferFallbackTimer) { clearTimeout(bufferFallbackTimer); bufferFallbackTimer = null; }
   if (decodeCtx) { decodeCtx.close().catch(() => {}); decodeCtx = null; }
 }
@@ -489,11 +523,14 @@ async function stopCapture() {
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "OFFSCREEN_START") {
     console.log("[offscreen] Received OFFSCREEN_START");
-    sessionId = message.sessionId;
-    sourceLang = message.sourceLang;
-    targetLang = message.targetLang;
-    startCapture(message.streamId).catch((err) => {
-      console.error("[offscreen] startCapture error:", err);
+    // Clean up any previous session before starting a new one
+    stopCapture().then(() => {
+      sessionId = message.sessionId;
+      sourceLang = message.sourceLang;
+      targetLang = message.targetLang;
+      startCapture(message.streamId).catch((err) => {
+        console.error("[offscreen] startCapture error:", err);
+      });
     });
   }
 
@@ -501,11 +538,21 @@ chrome.runtime.onMessage.addListener((message) => {
     stopCapture();
   }
 
-  // Service worker tells us the replay zone is over — resume capturing
+  // Buffer is low — send the held chunk to bridge the gap, but keep
+  // holdChunks = true so subsequent replay-zone chunks are blocked.
   if (message.type === "RESUME_CAPTURE") {
-    console.log("[offscreen] Resuming capture (replay zone ended)");
-    if (workletNode) {
-      workletNode.port.postMessage({ type: "SET_CAPTURE_ACTIVE", active: true });
+    console.log("[offscreen] Discarding held chunk (replayed audio)");
+    heldChunk = null;
+  }
+
+  // Video has exited the replay zone — all new worklet audio is fresh content.
+  if (message.type === "ZONE_ENDED") {
+    console.log("[offscreen] Replay zone fully exited — resuming chunk flow");
+    holdChunks = false;
+    if (heldChunk) {
+      console.log("[offscreen] Sending interim held chunk");
+      sendPcmChunk(heldChunk.samples, heldChunk.nativeSR);
+      heldChunk = null;
     }
   }
 

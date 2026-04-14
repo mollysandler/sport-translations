@@ -94,6 +94,10 @@ function loadSidepanel(opts = {}) {
       const listener = els.dismissBtn._listeners.click;
       if (listener && listener.length) listener[0]();
     },
+    /** Simulate playback starting (enables caption display) */
+    startPlayback() {
+      chrome._simulateMessage({ type: "HIDE_OVERLAY" }, {});
+    },
   };
 }
 
@@ -338,6 +342,7 @@ describe("error banner", () => {
 
 describe("caption dedup", () => {
   function addCaption(env, text, speaker = "Speaker 1") {
+    if (!env._playbackStarted) { env.startPlayback(); env._playbackStarted = true; }
     env.sendMsg({ type: "CAPTION", caption: { speaker, translated: text, original: text } });
   }
 
@@ -443,6 +448,7 @@ describe("caption dedup", () => {
 
 describe("caption rendering", () => {
   function addCaption(env, text, speaker = "Speaker 1") {
+    if (!env._playbackStarted) { env.startPlayback(); env._playbackStarted = true; }
     env.sendMsg({ type: "CAPTION", caption: { speaker, translated: text, original: text } });
   }
 
@@ -490,6 +496,7 @@ describe("caption rendering", () => {
 
   test("original text shown when different from translated", () => {
     const env = loadSidepanel();
+    env.startPlayback();
     env.sendMsg({
       type: "CAPTION",
       caption: { speaker: "Speaker 1", translated: "Goal!", original: "Gol!" },
@@ -502,6 +509,7 @@ describe("caption rendering", () => {
 
   test("original text hidden when same as translated", () => {
     const env = loadSidepanel();
+    env.startPlayback();
     env.sendMsg({
       type: "CAPTION",
       caption: { speaker: "Speaker 1", translated: "Goal!", original: "Goal!" },
@@ -544,12 +552,14 @@ describe("message handling", () => {
   test("CAPTION hides warming-up and stops timer", () => {
     const env = loadSidepanel();
     env.clickStart(); // start → warming up
+    env.startPlayback(); // enable caption display
     env.sendMsg({ type: "CAPTION", caption: { speaker: "S1", translated: "Hi", original: "Hola" } });
     expect(env.els.warmingUp.classList._set.has("hidden")).toBe(true);
   });
 
   test("CAPTION sets status to streaming", () => {
     const env = loadSidepanel();
+    env.startPlayback(); // enable caption display
     env.sendMsg({ type: "CAPTION", caption: { speaker: "S1", translated: "Hi", original: "Hola" } });
     expect(env.els.statusBadge.className).toContain("streaming");
   });

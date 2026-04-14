@@ -1,5 +1,9 @@
 /**
- * Comprehensive tests: cross-component verification and bug detection.
+ * Cross-component verification tests.
+ * Message contract tests catch interface drift between components.
+ * Stale code checks are cheap guardrails for removed features.
+ * Source-text safety tests (VIDEO_PAUSE, rate reset, cooldown) have been
+ * removed — they are now covered behaviorally in service-worker.test.js.
  */
 const fs = require("fs");
 const path = require("path");
@@ -56,7 +60,6 @@ describe("message contract", () => {
 
 describe("offscreen: no stale code", () => {
   test("no old drift formula variables", () => {
-    // These were from previous iterations and caused ReferenceErrors
     const match = offscreenSource.match(/function checkBuffer\(\)([\s\S]*?)^}/m);
     if (match) {
       expect(match[1]).not.toContain("elapsedSinceCapture");
@@ -73,44 +76,6 @@ describe("offscreen: no stale code", () => {
   test("no skip logic (replaced by worklet mute)", () => {
     expect(offscreenSource).not.toContain("skipAudioSec");
     expect(offscreenSource).not.toContain("skippedSoFarSec");
-  });
-});
-
-// ============================================================================
-// Service worker: no deadlock paths
-// ============================================================================
-
-describe("service-worker: safety", () => {
-  test("NEVER pauses video in any handler", () => {
-    // Extract all function bodies and check none send VIDEO_PAUSE
-    // (only handleStopCapture should reference VIDEO_CLEANUP, not VIDEO_PAUSE)
-    const handlers = [
-      /function handleTransitionToPlayback([\s\S]*?)^}/m,
-      /function handleBufferStatus([\s\S]*?)^}/m,
-    ];
-    for (const pattern of handlers) {
-      const match = serviceWorkerSource.match(pattern);
-      if (match) expect(match[1]).not.toContain('"VIDEO_PAUSE"');
-    }
-  });
-
-  test("handleStopCapture resets video rate", () => {
-    const match = serviceWorkerSource.match(
-      /async function handleStopCapture\(\)([\s\S]*?)^}/m
-    );
-    expect(match[1]).toContain("VIDEO_RESET_RATE");
-  });
-
-  test("handleStopCapture stops replay zone polling", () => {
-    const match = serviceWorkerSource.match(
-      /async function handleStopCapture\(\)([\s\S]*?)^}/m
-    );
-    expect(match[1]).toContain("stopReplayZonePoll");
-  });
-
-  test("adaptive rate has cooldown", () => {
-    expect(serviceWorkerSource).toContain("RATE_ADJUST_COOLDOWN_MS");
-    expect(serviceWorkerSource).toContain("lastRateAdjustAt");
   });
 });
 
@@ -136,7 +101,7 @@ describe("content-script: VIDEO_FOUND", () => {
 });
 
 // ============================================================================
-// WAV encoding correctness
+// WAV encoding correctness (pure function reference test)
 // ============================================================================
 
 describe("encodeWav", () => {

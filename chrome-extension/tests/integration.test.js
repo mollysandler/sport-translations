@@ -1,38 +1,9 @@
 /**
- * Integration tests for the throughput-matched sync model.
+ * Integration tests: pure-function logic tests and cross-component behavioral tests.
+ * Source-text tests and duplicates removed — those are now covered behaviorally in
+ * offscreen.test.js, service-worker.test.js, and sidepanel.test.js.
  */
 const { createMockVideo, createChromeMock, evalScript } = require("./helpers");
-
-// ============================================================================
-// Caption deduplication
-// ============================================================================
-
-describe("caption deduplication", () => {
-  function createCaptionStore() {
-    const captions = [];
-    function addCaption(caption) {
-      const newText = (caption.translated || caption.text || "").trim();
-      const recent = captions.slice(-5);
-      if (newText && recent.some(c => (c.translated || c.text || "").trim() === newText)) return false;
-      captions.push(caption);
-      return true;
-    }
-    return { captions, addCaption };
-  }
-
-  test("rejects exact duplicate of recent caption", () => {
-    const { captions, addCaption } = createCaptionStore();
-    addCaption({ translated: "Hello" });
-    expect(addCaption({ translated: "Hello" })).toBe(false);
-    expect(captions).toHaveLength(1);
-  });
-
-  test("allows duplicate after scrolling out of last 5", () => {
-    const { addCaption } = createCaptionStore();
-    "ABCDEF".split("").forEach(c => addCaption({ translated: c }));
-    expect(addCaption({ translated: "A" })).toBe(true);
-  });
-});
 
 // ============================================================================
 // Original text display
@@ -53,35 +24,7 @@ describe("original text display", () => {
 });
 
 // ============================================================================
-// Throughput measurement
-// ============================================================================
-
-describe("throughput measurement", () => {
-  // Now uses 0.9 safety margin (not 0.85), and measures from firstSegmentReceivedAt
-  function measureRate(bufferedDurationSec, elapsedMs) {
-    const raw = elapsedMs > 0 ? bufferedDurationSec / (elapsedMs / 1000) : 0.75;
-    return Math.max(Math.min(raw, 1.0) * 0.9, 0.5);
-  }
-
-  test("8s buffered in 8s → rate 0.9", () => {
-    expect(measureRate(8, 8000)).toBeCloseTo(0.9);
-  });
-
-  test("8s buffered in 6s → rate 0.9 (capped at 1.0 * 0.9)", () => {
-    expect(measureRate(8, 6000)).toBeCloseTo(0.9);
-  });
-
-  test("8s buffered in 16s → rate 0.5 (floored)", () => {
-    expect(measureRate(8, 16000)).toBe(0.5);
-  });
-
-  test("8s buffered in 10s → rate ~0.72", () => {
-    expect(measureRate(8, 10000)).toBeCloseTo(0.72);
-  });
-});
-
-// ============================================================================
-// Adaptive rate logic
+// Adaptive rate logic (pure function — mirrors service-worker.js handleBufferStatus)
 // ============================================================================
 
 describe("adaptive rate simulation", () => {
@@ -121,7 +64,7 @@ describe("adaptive rate simulation", () => {
     let steps = 0;
     while (rate < 1.0) { rate = adaptRate(rate, 10); steps++; }
     expect(rate).toBe(1.0);
-    expect(steps).toBeLessThanOrEqual(6); // ~5-6 steps × 0.10 = 0.50-0.60
+    expect(steps).toBeLessThanOrEqual(6);
   });
 
   test("convergence: starts at 1.0, with low buffer, approaches 0.5", () => {
@@ -136,7 +79,6 @@ describe("adaptive rate simulation", () => {
 // ============================================================================
 
 describe("adaptive rate recovers quickly when buffer is healthy", () => {
-  // Replicate the fixed adaptive rate from service-worker.js
   function adaptRate(currentRate, bufferSec) {
     if (bufferSec > 8) return Math.min(currentRate + 0.10, 1.0);
     if (bufferSec > 6) return Math.min(currentRate + 0.05, 1.0);
@@ -144,77 +86,29 @@ describe("adaptive rate recovers quickly when buffer is healthy", () => {
     return currentRate;
   }
 
-  test("recovers from 0.5 to 1.0 in ≤ 10 steps with very healthy buffer", () => {
+  test("recovers from 0.5 to 1.0 in <= 10 steps with very healthy buffer", () => {
     let rate = 0.5;
     let steps = 0;
     while (rate < 1.0) {
-      rate = adaptRate(rate, 10); // very healthy buffer
+      rate = adaptRate(rate, 10);
       steps++;
     }
-    // At +0.10 per step: 5 steps × 2s cooldown = 10 seconds. Acceptable.
     expect(steps).toBeLessThanOrEqual(10);
   });
 
-  test("recovers from 0.5 to 1.0 in ≤ 15 steps with healthy buffer", () => {
+  test("recovers from 0.5 to 1.0 in <= 15 steps with healthy buffer", () => {
     let rate = 0.5;
     let steps = 0;
     while (rate < 1.0) {
-      rate = adaptRate(rate, 7); // healthy but not extreme
+      rate = adaptRate(rate, 7);
       steps++;
     }
-    // At +0.05 per step: 10 steps × 2s = 20 seconds. OK.
     expect(steps).toBeLessThanOrEqual(15);
   });
 });
 
-describe("throughput measurement excludes cold start", () => {
-  test("measuredRate uses firstSegmentReceivedAt (backend warm), not captureStartedAt", () => {
-    const fs = require("fs");
-    const path = require("path");
-    const offSource = fs.readFileSync(
-      path.resolve(__dirname, "..", "offscreen", "offscreen.js"), "utf-8"
-    );
-    const match = offSource.match(/function startPlayback\(\)([\s\S]*?)^}/m);
-    expect(match[1]).toContain("firstSegmentReceivedAt");
-  });
-
-  test("safety margin is 0.9 (not 0.85) to avoid being too conservative", () => {
-    const fs = require("fs");
-    const path = require("path");
-    const offSource = fs.readFileSync(
-      path.resolve(__dirname, "..", "offscreen", "offscreen.js"), "utf-8"
-    );
-    const match = offSource.match(/function startPlayback\(\)([\s\S]*?)^}/m);
-    expect(match[1]).toContain("* 0.9");
-  });
-});
-
 // ============================================================================
-// Deadlock prevention
-// ============================================================================
-
-describe("deadlock prevention: video never pauses", () => {
-  test("handleBufferStatus does NOT pause video", () => {
-    const fs = require("fs");
-    const path = require("path");
-    const swSource = fs.readFileSync(path.resolve(__dirname, "..", "service-worker.js"), "utf-8");
-    const match = swSource.match(/function handleBufferStatus([\s\S]*?)^}/m);
-    expect(match).not.toBeNull();
-    expect(match[1]).not.toContain('"VIDEO_PAUSE"');
-  });
-
-  test("handleTransitionToPlayback does NOT pause video", () => {
-    const fs = require("fs");
-    const path = require("path");
-    const swSource = fs.readFileSync(path.resolve(__dirname, "..", "service-worker.js"), "utf-8");
-    const match = swSource.match(/function handleTransitionToPlayback([\s\S]*?)^}/m);
-    expect(match).not.toBeNull();
-    expect(match[1]).not.toContain('"VIDEO_PAUSE"');
-  });
-});
-
-// ============================================================================
-// Seek-back position correctness
+// Seek-back position correctness (behavioral)
 // ============================================================================
 
 describe("seek-back position", () => {
@@ -232,24 +126,6 @@ describe("seek-back position", () => {
     handler({ type: "VIDEO_SEEK", time: 45.2 }, {}, (r) => { response = r; });
     expect(video.currentTime).toBe(45.2);
     expect(response.ok).toBe(true);
-  });
-
-  test("seek position is computed from current video pos minus totalAudioSentSec", () => {
-    // The seek target should be VIDEO_REPORT_TIME → (currentTime - totalAudioSentSec)
-    // NOT captureStartVideoTime (which is stale from VIDEO_FOUND time)
-    const fs = require("fs");
-    const path = require("path");
-    const swSource = fs.readFileSync(path.resolve(__dirname, "..", "service-worker.js"), "utf-8");
-    const match = swSource.match(/function handleTransitionToPlayback([\s\S]*?)^}/m);
-    expect(match).not.toBeNull();
-    const body = match[1];
-
-    // Should query current position via VIDEO_REPORT_TIME
-    expect(body).toContain("VIDEO_REPORT_TIME");
-    // Should compute seekTarget from currentPos - totalAudioSentSec
-    expect(body).toContain("currentPos - totalAudioSentSec");
-    // The seek time should use seekTarget, not captureStartVideoTime directly
-    expect(body).toContain("time: seekTarget");
   });
 });
 

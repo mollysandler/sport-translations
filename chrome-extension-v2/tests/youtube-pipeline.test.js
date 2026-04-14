@@ -346,47 +346,36 @@ function createAudioEnv(opts = {}) {
 }
 
 // #####################################################################
-// CONTENT SCRIPT — seekback mode (canvas disabled)
+// CONTENT SCRIPT — canvas mode (re-enabled with CSS dimension fix)
 // #####################################################################
 
-describe("YouTube seekback mode — content script", () => {
-  test("always selects seekback mode on YouTube", () => {
+describe("YouTube canvas mode — content script", () => {
+  test("selects canvas mode for non-DRM video", () => {
     const env = loadContentScript();
     const resp = env.sendMsg({ type: "START_SYNC" });
     expect(resp).toHaveBeenCalledWith(
-      expect.objectContaining({ ok: true, mode: "seekback" })
+      expect.objectContaining({ ok: true, mode: "canvas" })
     );
   });
 
-  test("video stays visible (no canvas overlay, no opacity change)", () => {
+  test("canvas element created and appended", () => {
     const env = loadContentScript();
     env.sendMsg({ type: "START_SYNC" });
-    expect(env.video.style.opacity).not.toBe("0");
-    expect(env.video.classList.contains("__lt-hidden")).toBe(false);
     const canvases = env.createdElements.filter((e) => e.tag === "canvas");
-    expect(canvases.length).toBe(0);
+    expect(canvases.length).toBeGreaterThanOrEqual(1);
   });
 
-  test("seekback seeks video back correctly", () => {
+  test("video hidden via CSS class", () => {
     const env = loadContentScript();
-    env.video.currentTime = 30;
     env.sendMsg({ type: "START_SYNC" });
-    env.sendMsg({ type: "VIDEO_SEEK_BACK", seekBackSec: 10 });
-    expect(env.video.currentTime).toBe(20);
+    expect(env.video.classList.contains("__lt-hidden")).toBe(true);
   });
 
-  test("rate adjustment works", () => {
+  test("cleanup restores video and removes canvas", () => {
     const env = loadContentScript();
     env.sendMsg({ type: "START_SYNC" });
-    env.sendMsg({ type: "VIDEO_ADJUST_RATE", rate: 0.95 });
-    expect(env.video.playbackRate).toBe(0.95);
-  });
-
-  test("cleanup resets playback rate", () => {
-    const env = loadContentScript();
-    env.sendMsg({ type: "START_SYNC" });
-    env.sendMsg({ type: "VIDEO_ADJUST_RATE", rate: 0.85 });
     env.sendMsg({ type: "VIDEO_CLEANUP" });
+    expect(env.video.classList.contains("__lt-hidden")).toBe(false);
     expect(env.video.playbackRate).toBe(1.0);
   });
 });

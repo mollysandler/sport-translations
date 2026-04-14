@@ -48,6 +48,7 @@ let silenceFrames = 0;
 
 let currentUtterance = null;
 let lastOriginalEndSec = 0;
+let translationOverrun = 0; // cumulative seconds that translated audio exceeds original duration
 
 // Synchronous dedup (must fire before any await in finalizeUtterance)
 let seenUtteranceKeys = new Set();
@@ -64,6 +65,12 @@ let syncMode = "canvas"; // "canvas" or "seekback"
 
 // Caption dedup — prevent relaying the same translated text twice
 let recentCaptions = [];
+
+// Caption sync — hold captions until their corresponding audio starts playing.
+// Keyed by seq number. Whichever arrives first (caption or audio schedule) stores
+// its data; the second arrival triggers the timed delivery.
+let pendingCaptions = new Map(); // seq -> caption object (caption arrived before audio scheduled)
+let scheduledAudioTimes = new Map(); // seq -> nextPlayTime (audio scheduled before caption arrived)
 
 // Seekback replay zone — suppress frames that are re-captured content.
 // After seekback, the video replays from 0 and the tab produces the same audio
@@ -120,6 +127,7 @@ async function startCapture(streamId, sourceLang, targetLang) {
   silenceFrames = 0;
   currentUtterance = null;
   lastOriginalEndSec = 0;
+  translationOverrun = 0;
   seenUtteranceKeys = new Set();
   highWaterEndSec = 0;
   firstFrameSentTime = 0;
@@ -219,6 +227,8 @@ function stopCapture() {
   decodedQueue = [];
   currentUtterance = null;
   lastOriginalEndSec = 0;
+  pendingCaptions.clear();
+  scheduledAudioTimes.clear();
 
   sendToSW({ type: "HIDE_OVERLAY" });
   sendToSW({ type: "STATUS", status: "idle" });
@@ -324,14 +334,31 @@ function handleTextMessage(data) {
       if (translated && recentCaptions.includes(translated)) break;
       recentCaptions.push(translated);
       if (recentCaptions.length > 20) recentCaptions.shift();
-      sendToSW({
-        type: "CAPTION",
-        caption: {
-          speaker: `Speaker ${data.speaker_id}`,
-          original: data.original,
-          translated,
-        },
-      });
+
+      const caption = {
+        speaker: `Speaker ${data.speaker_id}`,
+        original: data.original,
+        translated,
+      };
+
+      // Sync caption with audio: delay delivery until the audio starts playing.
+      if (!playbackCtx || data.seq === undefined) {
+        // No audio context or no seq — send immediately (fallback)
+        sendToSW({ type: "CAPTION", caption });
+      } else {
+        const timing = scheduledAudioTimes.get(data.seq);
+        if (timing) {
+          const delayMs = Math.max(0, (timing - playbackCtx.currentTime) * 1000);
+          if (delayMs < 50) {
+            sendToSW({ type: "CAPTION", caption });
+          } else {
+            setTimeout(() => sendToSW({ type: "CAPTION", caption }), delayMs);
+          }
+          scheduledAudioTimes.delete(data.seq);
+        } else {
+          pendingCaptions.set(data.seq, caption);
+        }
+      }
       break;
     }
     case "error":
@@ -499,16 +526,43 @@ function scheduleAudioItem(item) {
     nextPlayTime = playbackCtx.currentTime + 0.05;
   }
 
-  // Insert natural gap from original speech timing.
-  // This includes the FIRST utterance: if speech starts at second 3,
-  // the 3-second gap lets the canvas draw frames 0-3 before audio begins,
-  // keeping canvas and audio aligned to the same video position.
+  // Track how much translated audio overruns the original speech duration.
+  // If a 2s original utterance produces 2.6s of TTS, that's +0.6s overrun.
+  // This accumulates across utterances as translations consistently expand.
+  const originalDuration = (item.originalEndSec || 0) - (item.originalStartSec || 0);
+  if (originalDuration > 0) {
+    translationOverrun += item.audioBuffer.duration - originalDuration;
+    if (translationOverrun < 0) translationOverrun = 0; // don't go negative
+  }
+
+  // Insert natural gap from original speech timing, but REDUCE it by the
+  // accumulated overrun. This self-corrects translation expansion drift:
+  // if translations are running long, gaps shrink to compensate.
+  // The audio content itself is NEVER cut or sped up — only silence shrinks.
   if (item.originalStartSec > lastOriginalEndSec) {
     const gap = item.originalStartSec - lastOriginalEndSec;
-    nextPlayTime += Math.min(gap, 3.0);
+    const adjustedGap = Math.max(0, gap - translationOverrun);
+    nextPlayTime += Math.min(adjustedGap, 3.0);
+    // Consume the overrun we just compensated for
+    translationOverrun = Math.max(0, translationOverrun - gap);
   }
 
   source.start(nextPlayTime);
+
+  // Sync caption delivery with audio playback.
+  const caption = pendingCaptions.get(item.seq);
+  if (caption) {
+    const delayMs = Math.max(0, (nextPlayTime - playbackCtx.currentTime) * 1000);
+    if (delayMs < 50) {
+      sendToSW({ type: "CAPTION", caption });
+    } else {
+      setTimeout(() => sendToSW({ type: "CAPTION", caption }), delayMs);
+    }
+    pendingCaptions.delete(item.seq);
+  } else if (item.seq !== undefined) {
+    scheduledAudioTimes.set(item.seq, nextPlayTime);
+  }
+
   nextPlayTime += item.audioBuffer.duration;
 
   if (item.originalEndSec > 0) lastOriginalEndSec = item.originalEndSec;

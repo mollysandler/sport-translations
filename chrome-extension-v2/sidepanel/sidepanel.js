@@ -24,6 +24,7 @@ const retryBtn = document.getElementById("retryBtn");
 const dismissBtn = document.getElementById("dismissBtn");
 
 let isCapturing = false;
+let playbackStarted = false; // suppress captions until audio is actually playing
 let captions = [];
 let connectingStartTime = null;
 let connectingTimerInterval = null;
@@ -164,6 +165,7 @@ async function stopCapture() {
   }
 
   isCapturing = false;
+  playbackStarted = false;
   startStopBtn.textContent = "Start Translating";
   startStopBtn.className = "btn btn-start";
   startStopBtn.disabled = false;
@@ -264,10 +266,18 @@ function extractSpeakerIndex(speaker) {
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "CAPTION") {
+    // Don't show captions until playback has started — during buffering
+    // the user sees the video but hears nothing, so captions are confusing.
+    if (!playbackStarted) return;
     warmingUp.classList.add("hidden");
     stopConnectingTimer();
     setStatus("streaming");
     addCaption(message.caption);
+  }
+
+  // HIDE_OVERLAY signals playback has begun (overlay is removed when audio starts)
+  if (message.type === "HIDE_OVERLAY" || message.type === "VIDEO_SYNC_STATUS") {
+    playbackStarted = true;
   }
 
   if (message.type === "STATUS") {
