@@ -22,8 +22,10 @@ const errorBanner = document.getElementById("errorBanner");
 const errorMessage = document.getElementById("errorMessage");
 const retryBtn = document.getElementById("retryBtn");
 const dismissBtn = document.getElementById("dismissBtn");
+const pauseResumeBtn = document.getElementById("pauseResumeBtn");
 
 let isCapturing = false;
+let isPaused = false;
 let playbackStarted = false; // suppress captions until audio is actually playing
 let captions = [];
 let connectingStartTime = null;
@@ -117,6 +119,31 @@ startStopBtn.addEventListener("click", () => {
   }
 });
 
+// -- Pause / Resume --
+
+pauseResumeBtn.addEventListener("click", () => {
+  if (isPaused) {
+    setPauseUI(false);
+    chrome.runtime.sendMessage({ type: "RESUME_ALL" });
+  } else {
+    setPauseUI(true);
+    chrome.runtime.sendMessage({ type: "PAUSE_ALL" });
+  }
+});
+
+function setPauseUI(paused) {
+  isPaused = paused;
+  if (paused) {
+    pauseResumeBtn.textContent = "Resume";
+    pauseResumeBtn.className = "btn btn-resume";
+    setStatus("paused");
+  } else {
+    pauseResumeBtn.textContent = "Pause";
+    pauseResumeBtn.className = "btn btn-pause";
+    setStatus("streaming");
+  }
+}
+
 async function startCapture() {
   startStopBtn.disabled = true;
   silenceWarning.classList.add("hidden");
@@ -165,10 +192,14 @@ async function stopCapture() {
   }
 
   isCapturing = false;
+  isPaused = false;
   playbackStarted = false;
   startStopBtn.textContent = "Start Translating";
   startStopBtn.className = "btn btn-start";
   startStopBtn.disabled = false;
+  pauseResumeBtn.classList.add("hidden");
+  pauseResumeBtn.textContent = "Pause";
+  pauseResumeBtn.className = "btn btn-pause hidden";
   warmingUp.classList.add("hidden");
   syncBadge.className = "sync-badge hidden";
   setStatus("idle");
@@ -182,6 +213,7 @@ function setStatus(status) {
     connecting: "Connecting...",
     streaming: "Live",
     buffering: "Buffering...",
+    paused: "Paused",
   };
   statusBadge.textContent = labels[status] || status;
   statusBadge.className = "status-badge " + status;
@@ -278,6 +310,18 @@ chrome.runtime.onMessage.addListener((message) => {
   // HIDE_OVERLAY signals playback has begun (overlay is removed when audio starts)
   if (message.type === "HIDE_OVERLAY" || message.type === "VIDEO_SYNC_STATUS") {
     playbackStarted = true;
+    if (isCapturing && !isPaused) {
+      pauseResumeBtn.classList.remove("hidden");
+    }
+  }
+
+  // Video pause/resume initiated by the user clicking the video player
+  if (message.type === "USER_PAUSED_VIDEO") {
+    setPauseUI(true);
+    pauseResumeBtn.classList.remove("hidden");
+  }
+  if (message.type === "USER_RESUMED_VIDEO") {
+    setPauseUI(false);
   }
 
   if (message.type === "STATUS") {

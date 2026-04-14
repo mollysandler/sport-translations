@@ -50,6 +50,10 @@
   let extensionPaused = false;
   let userPaused = false;
 
+  // Guards to distinguish extension-triggered pause/play from user-triggered
+  let extensionTriggeredPause = false;
+  let extensionTriggeredPlay = false;
+
   const MAX_BUFFER_FRAMES = 300; // hard cap (~10s at 30fps — must accommodate full pipeline delay)
   const CANVAS_SCALE = 480; // capture height (lower = less memory, 300 frames at 480p ≈ 500MB)
 
@@ -95,9 +99,29 @@
 
   function bindPauseDetection(v) {
     v.addEventListener("pause", () => {
-      if (!extensionPaused) userPaused = true;
+      if (extensionTriggeredPause) {
+        extensionTriggeredPause = false;
+        return;
+      }
+      if (!extensionPaused) {
+        userPaused = true;
+        sendMsg({ type: "USER_PAUSED_VIDEO" });
+      }
     });
-    v.addEventListener("play", () => { userPaused = false; });
+    v.addEventListener("play", () => {
+      if (extensionTriggeredPlay) {
+        extensionTriggeredPlay = false;
+        userPaused = false;
+        return;
+      }
+      // User manually resumed (either overriding extension pause or their own pause)
+      if (userPaused || extensionPaused) {
+        userPaused = false;
+        extensionPaused = false;
+        sendMsg({ type: "USER_RESUMED_VIDEO" });
+      }
+      userPaused = false;
+    });
   }
 
   function sendMsg(msg) {
@@ -498,6 +522,26 @@
         sendResponse({ ok: true });
         break;
 
+      // --- Pause / Resume from side panel ---
+      case "PAUSE_ALL":
+        extensionPaused = true;
+        if (video && !video.paused) {
+          extensionTriggeredPause = true;
+          video.pause();
+        }
+        sendResponse({ ok: true });
+        break;
+
+      case "RESUME_ALL":
+        extensionPaused = false;
+        userPaused = false;
+        if (video && video.paused) {
+          extensionTriggeredPlay = true;
+          video.play().catch(() => {});
+        }
+        sendResponse({ ok: true });
+        break;
+
       // --- Seek-back fallback commands ---
       case "VIDEO_SEEK_BACK":
         handleSeekback(msg.seekBackSec);
@@ -590,6 +634,8 @@
     syncMode = null;
     canvasActive = false;
     drawingActive = false;
+    extensionTriggeredPause = false;
+    extensionTriggeredPlay = false;
   };
 
   init();

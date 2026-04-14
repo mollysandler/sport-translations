@@ -44,6 +44,7 @@ let totalAudioCapturedSec = 0;
 let heartbeatInterval = null;
 let swKeepaliveInterval = null;
 let fallbackTimer = null;
+let isPaused = false;
 let silenceFrames = 0;
 
 let currentUtterance = null;
@@ -65,6 +66,9 @@ let syncMode = "canvas"; // "canvas" or "seekback"
 
 // Caption dedup — prevent relaying the same translated text twice
 let recentCaptions = [];
+
+// Captions held while paused — flushed in order on resume
+let heldCaptions = [];
 
 // Caption sync — hold captions until their corresponding audio starts playing.
 // Keyed by seq number. Whichever arrives first (caption or audio schedule) stores
@@ -89,6 +93,23 @@ function sendToSW(msg) {
   try { chrome.runtime.sendMessage(msg).catch(() => {}); } catch (e) {}
 }
 
+/** Send a caption now or hold it if paused. */
+function sendCaption(caption) {
+  if (isPaused) {
+    heldCaptions.push(caption);
+  } else {
+    sendToSW({ type: "CAPTION", caption });
+  }
+}
+
+/** Flush held captions (called on resume). */
+function flushHeldCaptions() {
+  for (const cap of heldCaptions) {
+    sendToSW({ type: "CAPTION", caption: cap });
+  }
+  heldCaptions = [];
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -109,6 +130,27 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     case "SYNC_MODE_REPORT":
       syncMode = msg.mode || "canvas";
       console.log(`[offscreen] Content script sync mode: ${syncMode}`);
+      break;
+
+    case "PAUSE_ALL":
+    case "USER_PAUSED_VIDEO":
+      isPaused = true;
+      if (playbackCtx && playbackCtx.state === "running") {
+        playbackCtx.suspend();
+      }
+      console.log("[offscreen] Paused");
+      break;
+
+    case "RESUME_ALL":
+    case "USER_RESUMED_VIDEO":
+      isPaused = false;
+      flushHeldCaptions();
+      if (playbackCtx && playbackCtx.state === "suspended") {
+        playbackCtx.resume().then(() => {
+          if (decodedQueue.length > 0 && isPlaying) scheduleBufferedAudio();
+        });
+      }
+      console.log("[offscreen] Resumed");
       break;
   }
 });
@@ -224,6 +266,8 @@ function stopCapture() {
   fallbackTimer = null;
 
   isPlaying = false;
+  isPaused = false;
+  heldCaptions = [];
   decodedQueue = [];
   currentUtterance = null;
   lastOriginalEndSec = 0;
@@ -240,6 +284,7 @@ function stopCapture() {
 
 async function handleAudioFrame(frame) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (isPaused) return;
 
   const frameDuration = frame.samples.length / frame.sampleRate;
   capturedFrameCount++;
@@ -344,15 +389,15 @@ function handleTextMessage(data) {
       // Sync caption with audio: delay delivery until the audio starts playing.
       if (!playbackCtx || data.seq === undefined) {
         // No audio context or no seq — send immediately (fallback)
-        sendToSW({ type: "CAPTION", caption });
+        sendCaption(caption);
       } else {
         const timing = scheduledAudioTimes.get(data.seq);
         if (timing) {
           const delayMs = Math.max(0, (timing - playbackCtx.currentTime) * 1000);
           if (delayMs < 50) {
-            sendToSW({ type: "CAPTION", caption });
+            sendCaption(caption);
           } else {
-            setTimeout(() => sendToSW({ type: "CAPTION", caption }), delayMs);
+            setTimeout(() => sendCaption(caption), delayMs);
           }
           scheduledAudioTimes.delete(data.seq);
         } else {
@@ -554,9 +599,9 @@ function scheduleAudioItem(item) {
   if (caption) {
     const delayMs = Math.max(0, (nextPlayTime - playbackCtx.currentTime) * 1000);
     if (delayMs < 50) {
-      sendToSW({ type: "CAPTION", caption });
+      sendCaption(caption);
     } else {
-      setTimeout(() => sendToSW({ type: "CAPTION", caption }), delayMs);
+      setTimeout(() => sendCaption(caption), delayMs);
     }
     pendingCaptions.delete(item.seq);
   } else if (item.seq !== undefined) {

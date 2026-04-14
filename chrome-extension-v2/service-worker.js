@@ -108,6 +108,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendToContentScript({ type: "VIDEO_ADJUST_RATE", rate: message.rate });
       break;
 
+    // --------------- Pause / Resume (side panel <-> offscreen + content script) ----
+    case "PAUSE_ALL":
+      sendToOffscreen({ type: "PAUSE_ALL" });
+      sendToContentScript({ type: "PAUSE_ALL" });
+      break;
+
+    case "RESUME_ALL":
+      sendToOffscreen({ type: "RESUME_ALL" });
+      sendToContentScript({ type: "RESUME_ALL" });
+      break;
+
+    // From content script when user pauses/resumes the video directly
+    case "USER_PAUSED_VIDEO":
+    case "USER_RESUMED_VIDEO":
+      broadcastToExtension(message);
+      break;
+
     // --------------- Keepalive ---------------
     case "keepalive":
       break;

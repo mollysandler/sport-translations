@@ -56,6 +56,7 @@ body {
 .sync-badge.waiting { background: #422006; color: #fbbf24; }
 .sync-badge.drifting { background: #7f1d1d; color: #fca5a5; }
 
+.status-badge.paused { background: #422006; color: #fbbf24; }
 .status-badge.connecting { background: #422006; color: #fbbf24; }
 .status-badge.streaming {
   background: #052e16;
@@ -115,6 +116,14 @@ body {
 .btn-stop { background: #dc2626; color: white; }
 .btn-stop:hover { background: #b91c1c; }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.btn-row { display: flex; gap: 8px; }
+.btn-row .btn { flex: 1; }
+
+.btn-pause { background: #d97706; color: white; }
+.btn-pause:hover { background: #b45309; }
+.btn-resume { background: #059669; color: white; }
+.btn-resume:hover { background: #047857; }
 
 .warning {
   background: #451a03;
