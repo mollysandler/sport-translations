@@ -4,6 +4,10 @@ speaker management for one WebSocket connection.
 
 One Session per connected client. Manages the full pipeline:
   Audio in -> Deepgram ASR -> Translate -> TTS -> Audio out
+
+Handles late-arriving speakers with a re-buffer phase: when a new
+speaker appears after playback has started, utterances from that speaker
+are queued while their voice characteristics are analyzed.
 """
 
 from __future__ import annotations
@@ -18,7 +22,9 @@ from protocol import (
     UtteranceStartMsg,
     UtteranceEndMsg,
     CaptionMsg,
-    SpeakerClonedMsg,
+    RebufferStartMsg,
+    RebufferProgressMsg,
+    RebufferEndMsg,
     ErrorMsg,
     encode_msg,
     MAX_CONCURRENT_UTTERANCES,
@@ -26,6 +32,8 @@ from protocol import (
 from deepgram_client import DeepgramStream
 from translator import translate_text
 from tts_client import TTSClient
+from tts_provider import VoiceDirective
+from voice_catalog import VoiceMatcher
 from speaker_manager import SpeakerManager
 
 logger = logging.getLogger(__name__)
@@ -40,7 +48,7 @@ class Session:
         target_lang: str,
         send_text: Callable[[str], asyncio.coroutines],  # send JSON text frame
         send_bytes: Callable[[bytes], asyncio.coroutines],  # send binary frame
-        enable_cloning: bool = True,
+        tts_provider: Optional[str] = None,
     ):
         self.session_id = str(uuid.uuid4())
         self._source_lang = source_lang
@@ -48,8 +56,9 @@ class Session:
         self._send_text = send_text
         self._send_bytes = send_bytes
 
-        self._tts = TTSClient()
-        self._speaker_mgr = SpeakerManager(self._tts, enable_cloning=enable_cloning)
+        self._tts = TTSClient(provider=tts_provider)
+        self._matcher = VoiceMatcher(provider=self._tts.provider_name)
+        self._speaker_mgr = SpeakerManager(self._matcher)
         self._deepgram: Optional[DeepgramStream] = None
 
         self._seq = 0  # utterance sequence counter
@@ -68,9 +77,13 @@ class Session:
         self._recent_utterance_list: list[str] = []  # FIFO for eviction
         self._last_utterance_end_sec: float = 0.0
 
-        # Track audio sent per speaker for voice cloning
+        # Audio buffer: attributed to the speaker of the next utterance
         self._audio_buffer: bytearray = bytearray()
-        self._audio_buffer_start_sec: float = 0.0
+
+        # Re-buffer state for late-arriving speakers
+        self._rebuffering_speaker: Optional[int] = None
+        self._rebuffer_queue: list[Utterance] = []
+        self._rebuffer_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -86,15 +99,21 @@ class Session:
         )
         await self._deepgram.start()
         logger.info(
-            "Session %s started (%s -> %s)",
+            "Session %s started (%s -> %s, provider=%s)",
             self.session_id,
             self._source_lang,
             self._target_lang,
+            self._tts.provider_name,
         )
 
     async def stop(self):
         """Stop the session and clean up all resources."""
         self._running = False
+
+        # Cancel rebuffer task
+        if self._rebuffer_task:
+            self._rebuffer_task.cancel()
+            self._rebuffer_task = None
 
         # Cancel pending utterance tasks
         for task in self._utterance_tasks:
@@ -107,7 +126,7 @@ class Session:
         if self._deepgram:
             await self._deepgram.stop()
 
-        # Clean up cloned voices
+        # Clean up speaker manager and TTS
         await self._speaker_mgr.cleanup()
         await self._tts.close()
         logger.info("Session %s stopped", self.session_id)
@@ -119,7 +138,8 @@ class Session:
     async def receive_audio(self, pcm16_bytes: bytes):
         """Receive raw PCM16 audio from the extension and forward to Deepgram.
 
-        Also buffers audio for speaker voice cloning.
+        Also buffers audio for speaker voice analysis. During re-buffer,
+        feeds audio directly to the new speaker for faster analysis.
         """
         if not self._running or self._deepgram is None:
             return
@@ -127,8 +147,13 @@ class Session:
         # Forward to Deepgram
         await self._deepgram.send_audio(pcm16_bytes)
 
-        # Buffer for speaker cloning (we'll attribute it when we know the speaker)
+        # Buffer for speaker attribution (assigned when utterance arrives)
         self._audio_buffer.extend(pcm16_bytes)
+
+        # During re-buffer, also feed audio directly to the new speaker
+        # so they accumulate audio even before Deepgram emits an utterance.
+        if self._rebuffering_speaker is not None:
+            self._speaker_mgr.add_audio(self._rebuffering_speaker, pcm16_bytes)
 
     # ------------------------------------------------------------------
     # Deepgram callbacks
@@ -160,12 +185,36 @@ class Session:
             self._last_utterance_end_sec, utterance.end_sec
         )
 
-        # Feed audio to speaker manager for potential cloning
+        # Feed audio to speaker manager for voice analysis
         if self._audio_buffer:
             self._speaker_mgr.add_audio(utterance.speaker_id, bytes(self._audio_buffer))
             self._audio_buffer.clear()
 
-        # Process the utterance asynchronously
+        # Check for late-arriving speaker requiring re-buffer
+        if (
+            self._speaker_mgr.playback_started
+            and self._speaker_mgr.is_new_speaker(utterance.speaker_id)
+            and self._rebuffering_speaker is None
+        ):
+            # New speaker after playback — start re-buffer
+            self._rebuffering_speaker = utterance.speaker_id
+            self._speaker_mgr.get_voice_id(utterance.speaker_id)  # register provisional
+            self._rebuffer_queue.append(utterance)
+            self._rebuffer_task = asyncio.create_task(
+                self._run_rebuffer(utterance.speaker_id)
+            )
+            logger.info(
+                "Late speaker %d detected — starting re-buffer",
+                utterance.speaker_id,
+            )
+            return
+
+        # If currently re-buffering and this is the new speaker, queue it
+        if self._rebuffering_speaker == utterance.speaker_id:
+            self._rebuffer_queue.append(utterance)
+            return
+
+        # Normal processing
         task = asyncio.create_task(self._process_utterance(utterance))
         self._utterance_tasks.append(task)
         task.add_done_callback(
@@ -177,6 +226,92 @@ class Session:
     def _on_utterance_end(self):
         """Called when Deepgram detects an utterance boundary (silence gap)."""
         pass  # The utterance callback handles everything
+
+    # ------------------------------------------------------------------
+    # Re-buffer for late-arriving speakers
+    # ------------------------------------------------------------------
+
+    async def _run_rebuffer(self, speaker_id: int):
+        """Wait for voice analysis of a late speaker, then drain queued utterances."""
+        try:
+            # Notify client to pause and show overlay
+            await self._send_text(encode_msg(RebufferStartMsg(speaker_id=speaker_id)))
+
+            # Poll analysis progress and send updates
+            info = self._speaker_mgr._speakers.get(speaker_id)
+            target_sec = 3.0
+
+            while info and not info.analysis_complete.is_set():
+                progress = min(100, int((info.audio_sec / target_sec) * 100))
+                await self._send_text(
+                    encode_msg(
+                        RebufferProgressMsg(
+                            speaker_id=speaker_id,
+                            progress=progress,
+                        )
+                    )
+                )
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(info.analysis_complete.wait()),
+                        timeout=0.5,
+                    )
+                    break  # Analysis complete
+                except asyncio.TimeoutError:
+                    continue  # Keep polling
+
+            # If analysis didn't complete, wait_for_analysis handles the timeout
+            if info and not info.analysis_complete.is_set():
+                await self._speaker_mgr.wait_for_analysis(speaker_id, timeout=5.0)
+
+            # Notify client to resume
+            await self._send_text(encode_msg(RebufferEndMsg(speaker_id=speaker_id)))
+
+            logger.info(
+                "Re-buffer complete for speaker %d — draining %d queued utterances",
+                speaker_id,
+                len(self._rebuffer_queue),
+            )
+
+            # Drain queued utterances into the normal pipeline
+            self._rebuffering_speaker = None
+            queued = list(self._rebuffer_queue)
+            self._rebuffer_queue.clear()
+
+            for utt in queued:
+                if not self._running:
+                    break
+                task = asyncio.create_task(self._process_utterance(utt))
+                self._utterance_tasks.append(task)
+                task.add_done_callback(
+                    lambda t: (
+                        self._utterance_tasks.remove(t)
+                        if t in self._utterance_tasks
+                        else None
+                    )
+                )
+
+        except asyncio.CancelledError:
+            self._rebuffering_speaker = None
+            self._rebuffer_queue.clear()
+        except Exception as e:
+            logger.error("Re-buffer failed for speaker %d: %s", speaker_id, e)
+            self._rebuffering_speaker = None
+            # Drain queue anyway with whatever voice we have
+            queued = list(self._rebuffer_queue)
+            self._rebuffer_queue.clear()
+            for utt in queued:
+                if not self._running:
+                    break
+                task = asyncio.create_task(self._process_utterance(utt))
+                self._utterance_tasks.append(task)
+                task.add_done_callback(
+                    lambda t: (
+                        self._utterance_tasks.remove(t)
+                        if t in self._utterance_tasks
+                        else None
+                    )
+                )
 
     # ------------------------------------------------------------------
     # Utterance processing pipeline
@@ -207,9 +342,8 @@ class Session:
                 )
 
                 if not translated.strip():
-                    # Mark as empty so the send loop can skip it
                     self._pending_results[seq] = None
-                    self._flush_pending()
+                    await self._flush_pending()
                     return
 
                 translated = _add_emotion_cues(utterance.text, translated)
@@ -222,9 +356,14 @@ class Session:
                     translated[:50],
                 )
 
-                # 3. TTS -> collect all audio chunks (don't send yet)
+                # 3. Derive emotion directive from source utterance
+                directive = _derive_directive(utterance, translated)
+
+                # 4. TTS -> collect all audio chunks (don't send yet)
                 audio_chunks = []
-                async for chunk in self._tts.synthesize(translated, voice_id):
+                async for chunk in self._tts.synthesize(
+                    translated, voice_id, directive
+                ):
                     audio_chunks.append(chunk)
 
                 total_audio_bytes = sum(len(c) for c in audio_chunks)
@@ -232,7 +371,7 @@ class Session:
                     total_audio_bytes * 8 / 64000 if total_audio_bytes > 0 else 0
                 )
 
-                # 4. Store result for ordered sending
+                # 5. Store result for ordered sending
                 self._pending_results[seq] = {
                     "seq": seq,
                     "speaker_id": speaker_id,
@@ -246,7 +385,6 @@ class Session:
                 raise
             except Exception as e:
                 logger.error("Utterance %d failed: %s", seq, e, exc_info=True)
-                # Mark as failed so the send loop can skip it
                 self._pending_results[seq] = None
 
         # After releasing the semaphore, flush any ready results in order
@@ -271,12 +409,6 @@ class Session:
                 translated = result["translated"]
 
                 try:
-                    # Check if cloning completed
-                    if self._speaker_mgr.is_speaker_cloned(speaker_id):
-                        await self._send_text(
-                            encode_msg(SpeakerClonedMsg(speaker_id=speaker_id))
-                        )
-
                     # Send utterance_start
                     await self._send_text(
                         encode_msg(
@@ -317,6 +449,13 @@ class Session:
                         )
                     )
 
+                    # Track that an utterance was sent with this voice
+                    self._speaker_mgr.mark_utterance_sent(speaker_id)
+
+                    # Mark playback as started after first utterance is delivered
+                    if not self._speaker_mgr.playback_started:
+                        self._speaker_mgr.mark_playback_started()
+
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -334,36 +473,47 @@ class Session:
                         pass
 
 
+# ---------------------------------------------------------------------------
+# Emotion analysis
+# ---------------------------------------------------------------------------
+
+
+def _derive_directive(utterance: Utterance, translated: str) -> VoiceDirective:
+    """Derive a VoiceDirective from the source utterance for TTS styling."""
+    has_exclamation = "!" in utterance.text
+    is_question = utterance.text.rstrip().endswith("?")
+    is_short = len(utterance.text.split()) <= 5
+
+    if has_exclamation and is_short:
+        return VoiceDirective(emotion="excited", energy=0.9, speed=1.05)
+    elif has_exclamation:
+        return VoiceDirective(emotion="enthusiastic", energy=0.7, speed=1.0)
+    elif is_question:
+        return VoiceDirective(emotion="curious", energy=0.5, speed=0.95)
+    else:
+        return VoiceDirective(emotion="neutral", energy=0.4, speed=1.0)
+
+
 def _add_emotion_cues(original_text: str, translated_text: str) -> str:
     """Enhance translated text with emotion cues for more expressive TTS.
 
-    ElevenLabs Flash v2.5 responds to:
-    - Exclamation marks → more energy
-    - CAPS → emphasis
-    - Ellipses → dramatic pauses
-    - Short punchy sentences → excitement
+    Works alongside VoiceDirective — text cues + voice settings = better results.
     """
-    # Detect excitement from the original text
-    # (Deepgram adds punctuation, so exclamation marks indicate source energy)
     original_has_exclamation = "!" in original_text
     original_is_short = len(original_text.split()) <= 5
     original_is_question = original_text.rstrip().endswith("?")
 
     text = translated_text.strip()
 
-    # If the original was exclamatory but translation lost the energy, restore it
     if original_has_exclamation and not text.endswith("!") and not text.endswith("?"):
         text = text.rstrip(".") + "!"
 
-    # Short exclamatory phrases: make them punchier
     if original_is_short and original_has_exclamation and len(text.split()) <= 6:
-        # Capitalize first significant word for emphasis
         words = text.split()
         if len(words) >= 2:
             words[0] = words[0].upper()
             text = " ".join(words)
 
-    # Preserve question intonation
     if original_is_question and not text.endswith("?"):
         text = text.rstrip(".!") + "?"
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from starlette.websockets import WebSocketState
@@ -65,6 +66,8 @@ async def ws_translate(
         if websocket.client_state == WebSocketState.CONNECTED:
             await websocket.send_bytes(data)
 
+    tts_provider = os.environ.get("TTS_PROVIDER", "elevenlabs")
+
     try:
         # Create session
         session = Session(
@@ -72,6 +75,7 @@ async def ws_translate(
             target_lang=target_lang,
             send_text=send_text,
             send_bytes=send_bytes,
+            tts_provider=tts_provider,
         )
         await session.start()
 
@@ -112,9 +116,12 @@ async def ws_translate(
                             target_lang=target_lang,
                             send_text=send_text,
                             send_bytes=send_bytes,
+                            tts_provider=tts_provider,
                         )
                         await session.start()
-                        await send_text(encode_msg(SessionReadyMsg(session_id=session.session_id)))
+                        await send_text(
+                            encode_msg(SessionReadyMsg(session_id=session.session_id))
+                        )
 
                 elif msg_type == "heartbeat":
                     await send_text(encode_msg(HeartbeatAckMsg()))

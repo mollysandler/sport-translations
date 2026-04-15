@@ -46,6 +46,9 @@
   let drmBlackFrames = 0; // consecutive all-black frames seen during DRM check
   let targetDelaySec = 3;
 
+  // Re-buffer state (late speaker detection)
+  let isRebuffering = false;
+
   // Seek-back fallback mode
   let extensionPaused = false;
   let userPaused = false;
@@ -247,6 +250,20 @@
     canvasCtx.fillText("Buffering translation\u2026", w / 2, h / 2);
   }
 
+  function drawRebufferOverlay() {
+    if (!canvasCtx || !canvasEl) return;
+    const w = canvasEl.width;
+    const h = canvasEl.height;
+    canvasCtx.fillStyle = "rgba(0, 0, 0, 0.4)";
+    canvasCtx.fillRect(0, 0, w, h);
+    const fontSize = Math.max(14, Math.round(h / 30));
+    canvasCtx.fillStyle = "white";
+    canvasCtx.font = `600 ${fontSize}px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+    canvasCtx.textAlign = "center";
+    canvasCtx.textBaseline = "middle";
+    canvasCtx.fillText("New speaker detected \u2014 analyzing voice\u2026", w / 2, h / 2);
+  }
+
   function requestFrame() {
     if (!canvasActive || !video) return;
     rvfcId = video.requestVideoFrameCallback(onVideoFrame);
@@ -294,6 +311,11 @@
       canvasPool.push(old.canvas);
     } else if (!drawingActive) {
       drawBufferingOverlay();
+    }
+
+    // ---- Step 3b: Draw rebuffer overlay on top of delayed frames ----
+    if (isRebuffering && drawingActive) {
+      drawRebufferOverlay();
     }
 
     // ---- Step 4: Hard cap ----
@@ -606,6 +628,35 @@
         sendResponse({ ok: true });
         break;
 
+      // --- Re-buffer for late speakers ---
+      case "REBUFFER_START":
+        isRebuffering = true;
+        if (syncMode === "seekback" && video && !video.paused) {
+          extensionTriggeredPause = true;
+          extensionPaused = true;
+          video.pause();
+        }
+        // Canvas mode: drawRebufferOverlay() is called in onVideoFrame loop
+        // Seekback mode: show DOM overlay
+        if (syncMode === "seekback") {
+          createOverlay("New speaker detected \u2014 analyzing voice...");
+        }
+        sendResponse({ ok: true });
+        break;
+
+      case "REBUFFER_END":
+        isRebuffering = false;
+        if (syncMode === "seekback") {
+          removeOverlay();
+          if (video && video.paused && extensionPaused) {
+            extensionTriggeredPlay = true;
+            extensionPaused = false;
+            video.play().catch(() => {});
+          }
+        }
+        sendResponse({ ok: true });
+        break;
+
       // --- Cleanup ---
       case "VIDEO_CLEANUP":
         if (window.__liveTranslatorV2Teardown) {
@@ -613,6 +664,7 @@
         }
         userPaused = false;
         extensionPaused = false;
+        isRebuffering = false;
         sendResponse({ ok: true });
         break;
     }
@@ -634,6 +686,7 @@
     syncMode = null;
     canvasActive = false;
     drawingActive = false;
+    isRebuffering = false;
     extensionTriggeredPause = false;
     extensionTriggeredPlay = false;
   };

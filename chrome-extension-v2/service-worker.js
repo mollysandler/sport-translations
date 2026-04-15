@@ -125,6 +125,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       broadcastToExtension(message);
       break;
 
+    // --------------- Re-buffer (offscreen -> content script + side panel) ------
+    case "REBUFFER_START":
+      sendToContentScript({ type: "REBUFFER_START" });
+      broadcastToExtension(message);
+      break;
+
+    case "REBUFFER_END":
+      sendToContentScript({ type: "REBUFFER_END" });
+      broadcastToExtension(message);
+      break;
+
     // --------------- Keepalive ---------------
     case "keepalive":
       break;

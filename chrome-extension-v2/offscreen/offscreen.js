@@ -40,6 +40,7 @@ let nextPlayTime = 0;
 let decodedQueue = [];
 let bufferedDurationSec = 0;
 let isPlaying = false;
+let isRebuffering = false;
 let totalAudioCapturedSec = 0;
 let heartbeatInterval = null;
 let swKeepaliveInterval = null;
@@ -267,6 +268,7 @@ function stopCapture() {
 
   isPlaying = false;
   isPaused = false;
+  isRebuffering = false;
   heldCaptions = [];
   decodedQueue = [];
   currentUtterance = null;
@@ -406,6 +408,36 @@ function handleTextMessage(data) {
       }
       break;
     }
+    case "rebuffer_start":
+      isRebuffering = true;
+      if (playbackCtx && playbackCtx.state === "running") {
+        playbackCtx.suspend();
+      }
+      sendToSW({ type: "SHOW_OVERLAY", text: "New speaker detected \u2014 analyzing voice..." });
+      sendToSW({ type: "REBUFFER_START" });
+      console.log(`[offscreen] Re-buffering for new speaker ${data.speaker_id}`);
+      break;
+
+    case "rebuffer_progress":
+      sendToSW({
+        type: "OVERLAY_PROGRESS",
+        text: `Analyzing new speaker... ${data.progress}%`,
+        progress: data.progress,
+      });
+      break;
+
+    case "rebuffer_end":
+      isRebuffering = false;
+      if (playbackCtx && playbackCtx.state === "suspended" && !isPaused) {
+        playbackCtx.resume().then(() => {
+          if (decodedQueue.length > 0 && isPlaying) scheduleBufferedAudio();
+        });
+      }
+      sendToSW({ type: "HIDE_OVERLAY" });
+      sendToSW({ type: "REBUFFER_END" });
+      console.log("[offscreen] Re-buffer complete — resuming playback");
+      break;
+
     case "error":
       if (!data.recoverable) { sendToSW({ type: "CAPTURE_ERROR", error: data.message }); stopCapture(); }
       else sendToSW({ type: "CHUNK_ERROR", error: data.message });
@@ -507,11 +539,12 @@ async function finalizeUtterance(utterance, originalStartSec, originalEndSec) {
     });
     bufferedDurationSec += audioBuffer.duration;
 
-    if (isPlaying) {
+    if (isPlaying && !isRebuffering) {
       scheduleBufferedAudio();
-    } else if (bufferedDurationSec >= TARGET_BUFFER_SEC) {
+    } else if (!isPlaying && bufferedDurationSec >= TARGET_BUFFER_SEC) {
       startPlayback();
     }
+    // During rebuffer: decoded audio stays in decodedQueue, scheduled on resume
   } catch (e) {
     console.error("[offscreen] Failed to decode audio:", e);
   }

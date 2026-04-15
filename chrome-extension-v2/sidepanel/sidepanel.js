@@ -324,6 +324,16 @@ chrome.runtime.onMessage.addListener((message) => {
     setPauseUI(false);
   }
 
+  // Re-buffer for late-arriving speakers
+  if (message.type === "REBUFFER_START") {
+    setStatus("buffering");
+  }
+  if (message.type === "REBUFFER_END") {
+    if (isCapturing && !isPaused) {
+      setStatus("streaming");
+    }
+  }
+
   if (message.type === "STATUS") {
     setStatus(message.status);
     if (message.status === "streaming") {

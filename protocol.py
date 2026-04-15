@@ -15,23 +15,23 @@ from dataclasses import dataclass, asdict
 # Constants
 # ---------------------------------------------------------------------------
 
-AUDIO_SAMPLE_RATE = 16000          # Hz – PCM input from extension
-AUDIO_FRAME_DURATION_MS = 200      # ms per binary frame from extension
+AUDIO_SAMPLE_RATE = 16000  # Hz – PCM input from extension
+AUDIO_FRAME_DURATION_MS = 200  # ms per binary frame from extension
 AUDIO_FRAME_BYTES = AUDIO_SAMPLE_RATE * 2 * AUDIO_FRAME_DURATION_MS // 1000  # 6400
-TARGET_BUFFER_SEC = 30             # seconds of translated audio before playback
-FALLBACK_BUFFER_SEC = 45           # start playback regardless after this many seconds
-DEEPGRAM_UTTERANCE_END_MS = 1500   # silence gap to finalize an utterance
-VOICE_CLONE_TARGET_SEC = 30.0      # seconds of audio to collect before cloning (longer = better quality)
-VOICE_CLONE_MIN_SEC = 20.0         # minimum seconds required to attempt cloning
-MAX_CONCURRENT_UTTERANCES = 3      # parallel utterance processing
-TTS_IDLE_TIMEOUT_SEC = 30          # close idle TTS WebSocket connections
-HEARTBEAT_INTERVAL_SEC = 25        # keepalive from extension
-DRIFT_POLL_INTERVAL_SEC = 2        # video position polling interval
+TARGET_BUFFER_SEC = 30  # seconds of translated audio before playback
+FALLBACK_BUFFER_SEC = 45  # start playback regardless after this many seconds
+DEEPGRAM_UTTERANCE_END_MS = 1500  # silence gap to finalize an utterance
+VOICE_ANALYSIS_SEC = 3.0  # seconds of audio needed for pitch/gender analysis
+MAX_CONCURRENT_UTTERANCES = 3  # parallel utterance processing
+TTS_IDLE_TIMEOUT_SEC = 30  # close idle TTS WebSocket connections
+HEARTBEAT_INTERVAL_SEC = 25  # keepalive from extension
+DRIFT_POLL_INTERVAL_SEC = 2  # video position polling interval
 
 
 # ---------------------------------------------------------------------------
 # Client -> Server messages (JSON text frames)
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class ConfigMsg:
@@ -59,6 +59,7 @@ class EndStreamMsg:
 # ---------------------------------------------------------------------------
 # Server -> Client messages (JSON text frames)
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class SessionReadyMsg:
@@ -95,15 +96,23 @@ class CaptionMsg:
 
 
 @dataclass
-class SpeakerClonedMsg:
+class RebufferStartMsg:
     speaker_id: int
-    type: str = "speaker_cloned"
+    reason: str = "new_speaker"
+    type: str = "rebuffer_start"
 
 
 @dataclass
-class BufferHintMsg:
-    recommended_buffer_sec: float
-    type: str = "buffer_hint"
+class RebufferProgressMsg:
+    speaker_id: int
+    progress: int = 0
+    type: str = "rebuffer_progress"
+
+
+@dataclass
+class RebufferEndMsg:
+    speaker_id: int
+    type: str = "rebuffer_end"
 
 
 @dataclass
@@ -122,9 +131,11 @@ class HeartbeatAckMsg:
 # Internal data types
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class Utterance:
     """A finalized transcript utterance from Deepgram."""
+
     text: str
     speaker_id: int
     start_sec: float
@@ -135,6 +146,7 @@ class Utterance:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def encode_msg(msg) -> str:
     """Serialize a dataclass message to JSON string."""

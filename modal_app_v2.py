@@ -35,14 +35,24 @@ streaming_image = (
         "deep-translator",
         "httpx",
         "numpy",
+        "openai>=1.0",  # OpenAI TTS provider (optional)
+        "cartesia",  # Cartesia TTS provider (optional)
     )
     .add_local_file("protocol.py", remote_path="/root/protocol.py", copy=True)
-    .add_local_file("deepgram_client.py", remote_path="/root/deepgram_client.py", copy=True)
+    .add_local_file(
+        "deepgram_client.py", remote_path="/root/deepgram_client.py", copy=True
+    )
+    .add_local_file("tts_provider.py", remote_path="/root/tts_provider.py", copy=True)
+    .add_local_file("voice_catalog.py", remote_path="/root/voice_catalog.py", copy=True)
     .add_local_file("tts_client.py", remote_path="/root/tts_client.py", copy=True)
-    .add_local_file("speaker_manager.py", remote_path="/root/speaker_manager.py", copy=True)
+    .add_local_file(
+        "speaker_manager.py", remote_path="/root/speaker_manager.py", copy=True
+    )
     .add_local_file("translator.py", remote_path="/root/translator.py", copy=True)
     .add_local_file("session.py", remote_path="/root/session.py", copy=True)
-    .add_local_file("streaming_server.py", remote_path="/root/streaming_server.py", copy=True)
+    .add_local_file(
+        "streaming_server.py", remote_path="/root/streaming_server.py", copy=True
+    )
     .add_local_file("utils.py", remote_path="/root/utils.py", copy=True)
 )
 
@@ -63,12 +73,14 @@ class StreamingService:
     @modal.asgi_app()
     def web(self):
         import logging
+
         logging.basicConfig(level=logging.INFO)
 
         from streaming_server import app as streaming_app
 
         # Add CORS middleware
         from starlette.middleware.cors import CORSMiddleware
+
         streaming_app.add_middleware(
             CORSMiddleware,
             allow_origins=[
@@ -97,15 +109,17 @@ batch_image = (
         add_python="3.11",
     )
     .apt_install("ffmpeg", "sox", "libsndfile1")
-    .env({
-        "HF_HOME": "/cache/hf",
-        "TRANSFORMERS_CACHE": "/cache/hf",
-        "TORCH_HOME": "/cache/torch",
-        "TRANSLATION_BACKEND": os.getenv("TRANSLATION_BACKEND", "local"),
-        "COQUI_TOS_AGREED": "1",
-        "HF_HUB_DISABLE_XET": "1",
-        "USE_VOICE_CLONING": "0",
-    })
+    .env(
+        {
+            "HF_HOME": "/cache/hf",
+            "TRANSFORMERS_CACHE": "/cache/hf",
+            "TORCH_HOME": "/cache/torch",
+            "TRANSLATION_BACKEND": os.getenv("TRANSLATION_BACKEND", "local"),
+            "COQUI_TOS_AGREED": "1",
+            "HF_HUB_DISABLE_XET": "1",
+            "USE_VOICE_CLONING": "0",
+        }
+    )
     .pip_install_from_requirements("requirements.txt")
     .pip_install_from_requirements("requirements_gpu.txt")
     .add_local_dir(".", remote_path="/root", copy=True)
@@ -141,11 +155,14 @@ class BatchService:
 
         self._translator_cache = {}
         self._sessions: dict = {}
-        self._tts_config = TTSConfig(qwen_enable=True, qwen_device="cuda", xtts_enable=True, xtts_device="cuda")
+        self._tts_config = TTSConfig(
+            qwen_enable=True, qwen_device="cuda", xtts_enable=True, xtts_device="cuda"
+        )
         self._speaker_merge = SpeakerMergeConfig()
 
     def _get_translator(self, source_lang: str, target_lang: str):
         from main import DynamicSpeakerTranslator
+
         key = (source_lang, target_lang)
         if key not in self._translator_cache:
             self._translator_cache[key] = DynamicSpeakerTranslator(
@@ -161,4 +178,5 @@ class BatchService:
     @modal.asgi_app()
     def fastapi_app(self):
         from api_server import make_app
+
         return make_app(self)

@@ -1,56 +1,28 @@
 """
-Speaker tracking, voice assignment, and voice cloning lifecycle.
+Speaker tracking and voice assignment.
 
-Maintains a mapping from Deepgram speaker_id -> ElevenLabs voice_id.
-Accumulates audio per speaker and triggers voice cloning when enough
-audio is collected.
+Maintains a mapping from Deepgram speaker_id -> TTS voice. Accumulates
+audio per speaker, analyzes pitch/gender/energy, and assigns the best
+matching voice via VoiceMatcher. Voices are locked after analysis.
+
+No voice cloning — uses stock/preset voices only.
 """
 
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
-import struct
 from typing import Optional
 
 import numpy as np
 
-from protocol import VOICE_CLONE_TARGET_SEC, VOICE_CLONE_MIN_SEC
-from tts_client import TTSClient
+from voice_catalog import VoiceEntry, VoiceMatcher
 from utils import estimate_pitch_yin, gender_from_pitch
 
 logger = logging.getLogger(__name__)
 
-
-def _pcm16_to_wav(
-    pcm_bytes: bytes, sample_rate: int = 16000, channels: int = 1
-) -> bytes:
-    """Wrap raw PCM16 bytes in a WAV header."""
-    bits_per_sample = 16
-    byte_rate = sample_rate * channels * bits_per_sample // 8
-    block_align = channels * bits_per_sample // 8
-    data_size = len(pcm_bytes)
-
-    buf = io.BytesIO()
-    # RIFF header
-    buf.write(b"RIFF")
-    buf.write(struct.pack("<I", 36 + data_size))
-    buf.write(b"WAVE")
-    # fmt chunk
-    buf.write(b"fmt ")
-    buf.write(struct.pack("<I", 16))  # chunk size
-    buf.write(struct.pack("<H", 1))  # PCM format
-    buf.write(struct.pack("<H", channels))
-    buf.write(struct.pack("<I", sample_rate))
-    buf.write(struct.pack("<I", byte_rate))
-    buf.write(struct.pack("<H", block_align))
-    buf.write(struct.pack("<H", bits_per_sample))
-    # data chunk
-    buf.write(b"data")
-    buf.write(struct.pack("<I", data_size))
-    buf.write(pcm_bytes)
-    return buf.getvalue()
+# Analysis threshold: seconds of audio needed before pitch/gender analysis
+ANALYSIS_THRESHOLD_SEC = 3.0
 
 
 class SpeakerInfo:
@@ -58,137 +30,190 @@ class SpeakerInfo:
 
     def __init__(self, speaker_id: int):
         self.speaker_id = speaker_id
-        self.voice_id: Optional[str] = None
-        self.is_cloned = False
-        self.clone_in_progress = False
-        self.audio_samples: bytearray = bytearray()  # raw PCM16 @ 16kHz
-        self.audio_sec: float = 0.0
+        self.voice_entry: Optional[VoiceEntry] = None
         self.gender: str = "male"
         self.avg_pitch: float = 150.0
+        self.energy: float = 0.5
+        self.is_locked: bool = False
+        self.utterances_sent: int = 0  # how many utterances used this voice
+        self.audio_samples: bytearray = bytearray()  # raw PCM16 @ 16kHz
+        self.audio_sec: float = 0.0
+        self.analysis_complete: asyncio.Event = asyncio.Event()
+
+    @property
+    def voice_id(self) -> Optional[str]:
+        return self.voice_entry.voice_id if self.voice_entry else None
 
 
 class SpeakerManager:
-    """Manages speaker -> voice mapping with cloning lifecycle."""
+    """Manages speaker -> voice mapping with analysis and locking."""
 
-    def __init__(self, tts_client: TTSClient, enable_cloning: bool = True):
-        self._tts = tts_client
-        self._enable_cloning = enable_cloning
+    def __init__(self, matcher: VoiceMatcher):
+        self._matcher = matcher
         self._speakers: dict[int, SpeakerInfo] = {}
-        self._cloned_voice_ids: list[str] = []  # for cleanup
-        self._clone_tasks: dict[int, asyncio.Task] = {}
+        self._playback_started = False
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def is_new_speaker(self, speaker_id: int) -> bool:
+        """Check if this speaker_id has never been seen. Does NOT register."""
+        return speaker_id not in self._speakers
+
+    def mark_playback_started(self) -> None:
+        """Mark that playback has begun — new speakers after this trigger re-buffer."""
+        self._playback_started = True
+
+    @property
+    def playback_started(self) -> bool:
+        return self._playback_started
 
     def get_voice_id(self, speaker_id: int) -> str:
-        """Get the current voice_id for a speaker. Assigns stock voice if new."""
+        """Get the current voice_id for a speaker. Assigns provisional voice if new."""
         info = self._speakers.get(speaker_id)
         if info is None:
             info = SpeakerInfo(speaker_id)
-            # Assign a stock voice immediately
-            info.voice_id = self._tts.assign_stock_voice(
-                gender=info.gender, avg_pitch=info.avg_pitch
+            # Assign a provisional voice with default characteristics
+            entry = self._matcher.match_voice(
+                gender=info.gender,
+                avg_pitch=info.avg_pitch,
+                energy=info.energy,
             )
+            info.voice_entry = entry
             self._speakers[speaker_id] = info
+            # Mark as used so the next speaker gets a different voice
+            self._matcher._used_voice_ids.add(entry.voice_id)
             logger.info(
-                "Speaker %d: assigned stock voice %s", speaker_id, info.voice_id
+                "Speaker %d: provisional voice -> %s (%s)",
+                speaker_id,
+                entry.display_name,
+                entry.voice_id,
             )
         return info.voice_id
 
-    def add_audio(self, speaker_id: int, pcm16_bytes: bytes):
-        """Add captured audio for a speaker. May trigger voice cloning."""
+    def mark_utterance_sent(self, speaker_id: int) -> None:
+        """Record that an utterance was sent using this speaker's current voice."""
+        info = self._speakers.get(speaker_id)
+        if info:
+            info.utterances_sent += 1
+
+    def add_audio(self, speaker_id: int, pcm16_bytes: bytes) -> None:
+        """Add captured audio for a speaker. Triggers analysis at threshold."""
         info = self._speakers.get(speaker_id)
         if info is None:
             # Auto-register
             self.get_voice_id(speaker_id)
             info = self._speakers[speaker_id]
 
-        if info.is_cloned or info.clone_in_progress:
-            return  # Already cloned or cloning
+        if info.is_locked:
+            return  # Already analyzed and locked
 
         info.audio_samples.extend(pcm16_bytes)
         info.audio_sec = len(info.audio_samples) / (16000 * 2)  # 16kHz 16-bit
 
-        # Analyze pitch/gender once we have enough audio (~3 seconds)
-        if info.audio_sec >= 3.0 and info.gender == "male" and info.avg_pitch == 150.0:
-            self._analyze_speaker(info)
-
-        # Trigger cloning when we have enough audio
+        # Analyze once we have enough audio
         if (
-            self._enable_cloning
-            and info.audio_sec >= VOICE_CLONE_MIN_SEC
-            and not info.clone_in_progress
+            info.audio_sec >= ANALYSIS_THRESHOLD_SEC
+            and not info.analysis_complete.is_set()
         ):
-            info.clone_in_progress = True
-            task = asyncio.create_task(self._clone_speaker(info))
-            self._clone_tasks[speaker_id] = task
+            self._analyze_and_lock(info)
 
-    def _analyze_speaker(self, info: SpeakerInfo):
-        """Analyze pitch/gender from accumulated audio."""
+    async def wait_for_analysis(self, speaker_id: int, timeout: float = 5.0) -> bool:
+        """Wait for a speaker's voice analysis to complete.
+
+        Returns True if analysis completed, False on timeout.
+        Used during re-buffer to block until the new speaker is analyzed.
+        """
+        info = self._speakers.get(speaker_id)
+        if info is None:
+            return False
+        if info.analysis_complete.is_set():
+            return True
+        try:
+            await asyncio.wait_for(info.analysis_complete.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            # Timeout — lock with whatever we have (provisional voice)
+            logger.warning(
+                "Speaker %d: analysis timed out after %.1fs (%.1fs audio). "
+                "Locking with provisional voice.",
+                speaker_id,
+                timeout,
+                info.audio_sec,
+            )
+            self._lock_speaker(info)
+            return False
+
+    # ------------------------------------------------------------------
+    # Analysis
+    # ------------------------------------------------------------------
+
+    def _analyze_and_lock(self, info: SpeakerInfo) -> None:
+        """Analyze pitch/gender/energy from accumulated audio and lock the voice."""
         try:
             pcm = (
                 np.frombuffer(info.audio_samples, dtype=np.int16).astype(np.float32)
                 / 32768.0
             )
+
+            # Pitch estimation
             pitch = estimate_pitch_yin(pcm, 16000)
             if pitch is not None:
                 info.avg_pitch = pitch
                 info.gender = gender_from_pitch(pitch)
-                # Re-assign stock voice with better pitch info
-                new_voice = self._tts.assign_stock_voice(
-                    gender=info.gender, avg_pitch=info.avg_pitch
-                )
-                if new_voice != info.voice_id and not info.is_cloned:
-                    info.voice_id = new_voice
-                    logger.info(
-                        "Speaker %d: re-assigned stock voice %s (gender=%s, pitch=%.0f)",
-                        info.speaker_id,
-                        info.voice_id,
-                        info.gender,
-                        info.avg_pitch,
-                    )
-        except Exception as e:
-            logger.warning("Speaker %d pitch analysis failed: %s", info.speaker_id, e)
 
-    async def _clone_speaker(self, info: SpeakerInfo):
-        """Clone a speaker's voice from accumulated audio."""
-        try:
-            # Use up to VOICE_CLONE_TARGET_SEC of audio
-            max_bytes = int(VOICE_CLONE_TARGET_SEC * 16000 * 2)
-            pcm_bytes = bytes(info.audio_samples[:max_bytes])
-            wav_bytes = _pcm16_to_wav(pcm_bytes)
+            # Energy estimation (RMS-based excitement level)
+            rms = np.sqrt(np.mean(pcm**2))
+            # Map RMS to 0-1 energy scale. Speech RMS typically 0.01-0.15.
+            info.energy = min(1.0, max(0.0, (rms - 0.01) / 0.12))
 
-            name = f"live-speaker-{info.speaker_id}"
-            voice_id = await self._tts.clone_voice(
-                name=name,
-                audio_bytes=wav_bytes,
-                description=f"Cloned from live speaker {info.speaker_id}",
+            logger.info(
+                "Speaker %d: analyzed — gender=%s, pitch=%.0fHz, energy=%.2f",
+                info.speaker_id,
+                info.gender,
+                info.avg_pitch,
+                info.energy,
             )
-
-            info.voice_id = voice_id
-            info.is_cloned = True
-            self._cloned_voice_ids.append(voice_id)
-            logger.info("Speaker %d: voice cloned -> %s", info.speaker_id, voice_id)
-
         except Exception as e:
-            logger.error("Speaker %d: voice cloning failed: %s", info.speaker_id, e)
-            # Check for permission/auth errors — disable cloning permanently
-            status = getattr(e, "status_code", None)
-            if status in (401, 403):
-                logger.warning(
-                    "Voice cloning disabled: API key lacks permission (HTTP %s)", status
-                )
-                self._enable_cloning = False
-            info.clone_in_progress = False
+            logger.warning("Speaker %d: analysis failed: %s", info.speaker_id, e)
 
-    def is_speaker_cloned(self, speaker_id: int) -> bool:
-        info = self._speakers.get(speaker_id)
-        return info is not None and info.is_cloned
+        # Now pick the best voice based on actual characteristics
+        new_entry = self._matcher.match_voice(
+            gender=info.gender,
+            avg_pitch=info.avg_pitch,
+            energy=info.energy,
+        )
 
-    async def cleanup(self):
-        """Cancel pending clones and delete cloned voices."""
-        for task in self._clone_tasks.values():
-            task.cancel()
-        self._clone_tasks.clear()
+        # Only swap voice if no utterances have been sent with the provisional one
+        if info.utterances_sent == 0 and new_entry.voice_id != info.voice_id:
+            logger.info(
+                "Speaker %d: upgrading voice %s -> %s (%s)",
+                info.speaker_id,
+                info.voice_entry.display_name if info.voice_entry else "?",
+                new_entry.display_name,
+                new_entry.voice_id,
+            )
+            info.voice_entry = new_entry
 
-        for voice_id in self._cloned_voice_ids:
-            await self._tts.delete_voice(voice_id)
-        self._cloned_voice_ids.clear()
+        self._lock_speaker(info)
+
+    def _lock_speaker(self, info: SpeakerInfo) -> None:
+        """Lock the speaker's current voice permanently."""
+        if info.is_locked:
+            return
+        info.is_locked = True
+        if info.voice_entry:
+            self._matcher.lock_voice(info.speaker_id, info.voice_entry)
+        info.analysis_complete.set()
+        # Free audio buffer — no longer needed
+        info.audio_samples = bytearray()
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+
+    async def cleanup(self) -> None:
+        """Clean up all state."""
         self._speakers.clear()
+        self._matcher.reset()
